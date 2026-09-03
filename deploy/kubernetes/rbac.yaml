@@ -1,0 +1,55 @@
+# Manager RBAC, scoped to the sandbox-manager namespace.
+#
+# This is deliberately the narrow set the manager needs and nothing more. The
+# manager never reads secrets, configmaps, or service accounts in-cluster; NATS
+# credentials are injected as environment from an externally-managed Secret, so
+# no Secret RBAC exists here. The sandbox Pods the manager creates carry
+# `automountServiceAccountToken: false` and expose no inbound Service, so the
+# manager principal is the only identity that can reach `pods/exec`.
+#
+# The `pods/exec` capability is the relay privilege: it is bound to one fixed,
+# qualified helper command (Decision 17 / KR-009), and argv never appears in a
+# request URL, header, or audit record. `pods/get`, `pods/exec`, and the
+# workload resource lifecycle are the approved resources and subresources
+# recorded for the staging API-audit assertion.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-manager
+  namespace: sandbox-manager
+  labels:
+    app.kubernetes.io/part-of: sandbox-manager
+rules:
+  # Pod identity verification and relay exec (the request that carries the
+  # fixed helper command) plus workload create/delete for provisioning.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # The relay's `pods/exec` subresource; authorized as the `create` verb.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Result volume lifecycle for retained results.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Default-deny network policy for each sandbox; no inbound path is opened.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-manager
+  namespace: sandbox-manager
+  labels:
+    app.kubernetes.io/part-of: sandbox-manager
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-manager
+    namespace: sandbox-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandbox-manager

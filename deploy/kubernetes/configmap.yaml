@@ -1,0 +1,29 @@
+# Non-secret manager configuration, mounted at /etc/sandbox-manager/config.
+#
+# NATS_URL references the Secret-supplied username and password by variable
+# expansion; the Secret itself is never rendered into this ConfigMap. The other
+# keys mirror the tracked `config/production.config`; keep the two in sync when
+# the key set changes. The `TARGET_KUBE_CONTEXT` and NATS host/port are
+# deployment-specific — the API server is reached in-cluster via the service
+# account, and the NATS service is provisioned separately.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandbox-manager-config
+  namespace: sandbox-manager
+  labels:
+    app.kubernetes.io/part-of: sandbox-manager
+data:
+  production.config: |
+    APP_ENV=production
+    MANAGER_PORT=15180
+    TARGET_KUBE_CONTEXT=in-cluster
+    GVISOR_RUNTIME_CLASS=gvisor
+    MAX_SANDBOXES=10
+    SANDBOX_CPU_REQUEST=250m
+    SANDBOX_MEMORY_REQUEST=256Mi
+    SANDBOX_CPU_LIMIT=1
+    SANDBOX_MEMORY_LIMIT=512Mi
+    AGENT_CHECK_INTERVAL=15s
+    AGENT_CHECK_TIMEOUT=5s
+    NATS_URL=nats://${NATS_USERNAME}:${NATS_PASSWORD}@nats.sandbox-manager.svc.cluster.local:4222

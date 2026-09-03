@@ -1,0 +1,30 @@
+# Python build and test output
+__pycache__/
+*.py[cod]
+*.egg-info/
+/.coverage
+/.pytest_cache/
+/build/
+/coverage/
+/dist/
+htmlcov/
+
+# Python environments
+/.venv/
+/venv/
+
+# Runtime output
+/.runtime/
+/tmp/
+*.log
+*.pid
+
+# Local secrets (examples remain tracked)
+*.env
+!*.env.example
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*~

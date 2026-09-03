@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-sandbox"
+version = "0.1.0"
+description = "Kubernetes and gVisor sandbox manager"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+sandbox-manager = "sandbox_manager.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

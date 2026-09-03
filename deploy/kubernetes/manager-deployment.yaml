@@ -1,0 +1,107 @@
+# Sandbox manager Deployment and a cluster-internal health Service.
+#
+# The manager speaks to the API server in-cluster (service-account token and
+# KUBERNETES_SERVICE_HOST/PORT), so it runs with `sandbox-manager`'s narrow
+# RBAC and no kubeconfig. The Service is cluster-internal only (no `type:
+# LoadBalancer`/`NodePort`); nothing exposes the sandbox workloads inward.
+#
+# Probes use the manager's /healthz and /readyz endpoints. Readiness flips
+# false on SIGTERM before the HTTP server stops, so a rolling update drains
+# gracefully; the durable command journal and fence keep restarts safe.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-manager
+  namespace: sandbox-manager
+  labels:
+    app.kubernetes.io/part-of: sandbox-manager
+    app.kubernetes.io/name: sandbox-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sandbox-manager
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sandbox-manager
+        app.kubernetes.io/part-of: sandbox-manager
+    spec:
+      serviceAccountName: sandbox-manager
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sandbox-manager
+          image: registry.example/sandbox-manager:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config
+            - /etc/sandbox-manager/production.config
+          ports:
+            - name: http
+              containerPort: 15180
+          env:
+            - name: NATS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-manager-nats
+                  key: NATS_USERNAME
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-manager-nats
+                  key: NATS_PASSWORD
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sandbox-manager
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+      volumes:
+        - name: config
+          configMap:
+            name: sandbox-manager-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-manager
+  namespace: sandbox-manager
+  labels:
+    app.kubernetes.io/part-of: sandbox-manager
+    app.kubernetes.io/name: sandbox-manager
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: sandbox-manager
+  ports:
+    - name: http
+      port: 15180
+      targetPort: http
