@@ -5,9 +5,9 @@
 # RBAC and no kubeconfig. The Service is cluster-internal only (no `type:
 # LoadBalancer`/`NodePort`); nothing exposes the sandbox workloads inward.
 #
-# Probes use the manager's /healthz and /readyz endpoints. Readiness flips
-# false on SIGTERM before the HTTP server stops, so a rolling update drains
-# gracefully; the durable command journal and fence keep restarts safe.
+# Probes use the manager's /healthz and /readyz endpoints. The current
+# operational shell remains unready until concrete runtime adapters are
+# composed; this prevents the template from receiving production traffic.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

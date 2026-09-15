@@ -1,4 +1,4 @@
-"""Manager-side relay workspace transfers (plan Section 5.3).
+"""Manager-side relay workspace transfers.
 
 Uploads stream caller-supplied bytes through the durable admission gate as
 relay ``STDIN`` frames: sequence 0 carries the helper operation vector
@@ -30,6 +30,7 @@ import json
 from collections.abc import AsyncIterator
 
 from .commands import CommandAdmissionGate, CommandResult, OutputSink
+from .identifiers import is_identifier
 from .relay_protocol import (
     MAX_DECLARED_BYTES,
     MAX_FRAME_PAYLOAD_BYTES,
@@ -85,7 +86,7 @@ class RelayWorkspaceService:
         inspector: PathInspector,
         principal: str,
     ) -> None:
-        if not isinstance(principal, str) or not principal.strip():
+        if not is_identifier(principal):
             raise WorkspaceError("principal must identify the agent session")
         self._gate = gate
         self._layout = layout
@@ -126,7 +127,7 @@ class RelayWorkspaceService:
             command_id=command_id,
             task_id=task_id,
             operation=RelayOperation.UPLOAD,
-            correlation_id=f"upload:{command_id}",
+            correlation_id=command_id,
             declared_input_bytes=declared_size,
             declared_output_bytes=0,
         )
@@ -172,36 +173,54 @@ class RelayWorkspaceService:
             command_id=command_id,
             task_id=task_id,
             operation=RelayOperation.DOWNLOAD,
-            correlation_id=f"download:{command_id}",
+            correlation_id=command_id,
             declared_input_bytes=0,
             declared_output_bytes=max_bytes,
         )
 
-        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2)
+        completed = asyncio.Event()
         received = 0
 
-        def sink(channel: int, payload: bytes) -> None:
+        async def sink(channel: int, payload: bytes) -> None:
             nonlocal received
             if channel != _STDOUT_CHANNEL:
                 return
             received += len(payload)
             if received > max_bytes:
                 raise WorkspaceLimitError("download exceeded its declared byte limit")
-            queue.put_nowait(payload)
+            await queue.put(payload)
 
         async def drive() -> CommandResult:
             try:
                 return await self._gate.run(self._principal, envelope, None, sink)
             finally:
-                queue.put_nowait(None)
+                completed.set()
 
         command = asyncio.create_task(drive())
         try:
             while True:
-                chunk = await queue.get()
-                if chunk is None:
+                if not queue.empty():
+                    yield queue.get_nowait()
+                    continue
+                if completed.is_set():
                     break
-                yield chunk
+                next_chunk = asyncio.create_task(queue.get())
+                completion = asyncio.create_task(completed.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {next_chunk, completion},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for pending in (next_chunk, completion):
+                        if not pending.done():
+                            pending.cancel()
+                    await asyncio.gather(
+                        next_chunk, completion, return_exceptions=True
+                    )
+                if next_chunk in done:
+                    yield next_chunk.result()
             result = await command
             if result.outcome is not CommandOutcome.SUCCESS:
                 raise WorkspaceTransferError(RelayOperation.DOWNLOAD, result)

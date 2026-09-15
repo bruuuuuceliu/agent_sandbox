@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import ipaddress
 import os
 import re
 import sys
@@ -14,6 +15,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import urlsplit
+
+from .identifiers import is_identifier
 
 MAX_CPU_MILLICORES = 1_000
 MAX_MEMORY_BYTES = 512 * 1024 * 1024
@@ -30,6 +33,9 @@ _DURATION_PART_PATTERN = re.compile(
 )
 _DURATION_VALUE_PATTERN = re.compile(
     r"(?P<number>[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?P<unit>ns|us|\N{MICRO SIGN}s|\N{GREEK SMALL LETTER MU}s|ms|s|m|h)"
+)
+_HOST_LABEL_PATTERN = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
 _DURATION_SECONDS = {
     "ns": Decimal("0.000000001"),
@@ -118,7 +124,9 @@ def load_config(
         raise ConfigError("config path must name a .config file")
 
     environment = os.environ if environ is None else environ
-    lookup: EnvironmentLookup = lambda key: environment.get(key)
+
+    def lookup(key: str) -> str | None:
+        return environment.get(key)
 
     try:
         with config_path.open(encoding="utf-8") as config_file:
@@ -371,9 +379,39 @@ def _parse_duration(value: str) -> timedelta:
 def _validate_nats_url(value: str) -> None:
     try:
         parsed = urlsplit(value)
-    except ValueError as error:
-        raise ConfigError("NATS_URL must be a valid NATS connection URL") from error
-    if not parsed.netloc:
-        raise ConfigError("NATS_URL must be a valid NATS connection URL")
-    if parsed.scheme not in {"nats", "tls", "ws", "wss"}:
-        raise ConfigError("NATS_URL must use nats, tls, ws, or wss")
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ConfigError("NATS_URL must be a valid NATS connection URL") from None
+    if parsed.scheme != "nats":
+        raise ConfigError("NATS_URL must use nats://")
+    if (
+        not parsed.netloc
+        or hostname is None
+        or not _is_usable_hostname(hostname)
+        or port is None
+        or port < 1
+        or parsed.username is None
+        or not is_identifier(parsed.username)
+        or parsed.password is None
+        or not parsed.password
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or any(character.isspace() for character in value)
+    ):
+        raise ConfigError(
+            "NATS_URL must include a valid hostname, port, username, and password"
+        )
+
+
+def _is_usable_hostname(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        hostname = value.removesuffix(".")
+        return (
+            0 < len(hostname) <= 253
+            and all(_HOST_LABEL_PATTERN.fullmatch(label) for label in hostname.split("."))
+        )
+    return True

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import unittest
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from typing import cast
 
@@ -16,7 +17,9 @@ from sandbox_manager.commands import (
     AdmissionFence,
     AdmissionLifecycle,
     AdmittedCommand,
+    CommandAdmission,
     CommandAdmissionGate,
+    CommandAudit,
     CommandAuditEntry,
     CommandResult,
     InMemoryCommandRepository,
@@ -27,6 +30,8 @@ from sandbox_manager.commands import (
 from sandbox_manager.nats_client import (
     AsyncNatsConnection,
     NatsAuthError,
+    NatsMessage,
+    NatsSubscription,
     NatsTransportError,
 )
 from sandbox_manager.nats_relay import (
@@ -40,13 +45,16 @@ from sandbox_manager.nats_relay import (
     task_subjects,
 )
 from sandbox_manager.relay_protocol import (
+    MAX_FRAME_BYTES,
     RELAY_SCHEMA_VERSION,
     CommandEnvelope,
     CommandOutcome,
     DataChannel,
     DataFrame,
     RelayOperation,
+    TerminalFrame,
     decode_frame,
+    encode_command_envelope,
     encode_frame,
 )
 
@@ -81,6 +89,11 @@ class RecordingAudit:
         self.entries.append(entry)
 
 
+class FailingAudit:
+    async def record(self, entry: CommandAuditEntry) -> None:
+        raise RuntimeError("audit transport unavailable")
+
+
 class BridgeRelay:
     """Stands in for the Kubernetes relay on the manager side."""
 
@@ -107,10 +120,107 @@ class BridgeRelay:
                 self.frames.append(frame)
         if output_sink is not None:
             for channel, payload in self._outputs:
-                output_sink(channel, payload)
+                await output_sink(channel, payload)
         if self._hang:
             await asyncio.Event().wait()
         return CommandResult(command.command_id, CommandOutcome.SUCCESS)
+
+
+class AdmissionSetupConnection(AsyncNatsConnection):
+    def __init__(
+        self,
+        *,
+        fail_subscribe_at: int | None = None,
+        block_subscribe_at: int | None = None,
+        fail_publish: bool = False,
+        fail_flush: bool = False,
+    ) -> None:
+        super().__init__("127.0.0.1", 4222, _MANAGER_USER, "unused", "setup")
+        self.fail_subscribe_at = fail_subscribe_at
+        self.block_subscribe_at = block_subscribe_at
+        self.fail_publish = fail_publish
+        self.fail_flush = fail_flush
+        self.subscribe_calls = 0
+        self.subscribe_blocked = asyncio.Event()
+        self.published_event = asyncio.Event()
+        self.subscriptions: list[NatsSubscription] = []
+        self.unsubscribed: list[NatsSubscription] = []
+        self.published: list[tuple[str, bytes]] = []
+        self.flush_calls = 0
+
+    async def subscribe(
+        self, subject: str, pending_limit: int = 64
+    ) -> NatsSubscription:
+        self.subscribe_calls += 1
+        if self.subscribe_calls == self.block_subscribe_at:
+            self.subscribe_blocked.set()
+            await asyncio.Event().wait()
+        if self.subscribe_calls == self.fail_subscribe_at:
+            raise NatsTransportError("injected subscription failure")
+        subscription = NatsSubscription(subject, pending_limit)
+        self.subscriptions.append(subscription)
+        return subscription
+
+    async def unsubscribe(self, subscription: NatsSubscription) -> None:
+        self.unsubscribed.append(subscription)
+
+    async def flush(self, timeout: float = 5.0) -> None:
+        self.flush_calls += 1
+        if self.fail_flush:
+            raise NatsTransportError("injected flush failure")
+
+    async def publish(
+        self,
+        subject: str,
+        payload: bytes,
+        reply: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self.published.append((subject, payload))
+        self.published_event.set()
+        if self.fail_publish:
+            raise NatsTransportError("injected publication failure")
+
+
+class FailFirstAdmissionGate(CommandAdmissionGate):
+    def __init__(
+        self, repository: InMemoryCommandRepository, relay: BridgeRelay
+    ) -> None:
+        super().__init__(
+            repository=repository,
+            policy=AllowPolicy(),
+            audit=RecordingAudit(),
+            relay=relay,
+            fence=AdmissionFence(_FENCE),
+            clock=FixedClock(),
+        )
+        self.calls = 0
+
+    async def admit_detailed(
+        self, principal: str, envelope: CommandEnvelope
+    ) -> CommandAdmission:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("injected request fault")
+        return await super().admit_detailed(principal, envelope)
+
+
+class FailFirstOutputConnection(AdmissionSetupConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def publish(
+        self,
+        subject: str,
+        payload: bytes,
+        reply: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise NatsTransportError("injected output failure")
+        await super().publish(subject, payload, reply, headers)
 
 
 class FakeNatsServer:
@@ -254,10 +364,8 @@ class _FakeNatsSession:
             return
 
     def close(self) -> None:
-        try:
+        with contextlib.suppress(ConnectionError, OSError):
             self._writer.close()
-        except (ConnectionError, OSError):
-            pass
 
     async def _send(self, data: bytes) -> None:
         try:
@@ -294,13 +402,15 @@ def _subject_matches(pattern: str, subject: str) -> bool:
         return False
     return all(
         expected == "*" or expected == actual
-        for expected, actual in zip(pattern_tokens, subject_tokens)
+        for expected, actual in zip(pattern_tokens, subject_tokens, strict=True)
     )
 
 
-def admission_state(agent_session_id: str = _AGENT_USER) -> TaskAdmissionState:
+def admission_state(
+    agent_session_id: str = _AGENT_USER, task_id: str = "task-1"
+) -> TaskAdmissionState:
     return TaskAdmissionState(
-        task_id="task-1",
+        task_id=task_id,
         agent_session_id=agent_session_id,
         profile="default",
         lifecycle=AdmissionLifecycle.READY,
@@ -309,23 +419,27 @@ def admission_state(agent_session_id: str = _AGENT_USER) -> TaskAdmissionState:
 
 
 def command_gate(
-    repository: InMemoryCommandRepository, relay: BridgeRelay
+    repository: InMemoryCommandRepository,
+    relay: BridgeRelay,
+    audit: CommandAudit | None = None,
 ) -> CommandAdmissionGate:
     return CommandAdmissionGate(
         repository=repository,
         policy=AllowPolicy(),
-        audit=RecordingAudit(),
+        audit=audit or RecordingAudit(),
         relay=relay,
         fence=AdmissionFence(_FENCE),
         clock=FixedClock(),
     )
 
 
-def envelope(command_id: str = "command-1") -> CommandEnvelope:
+def envelope(
+    command_id: str = "command-1", task_id: str = "task-1"
+) -> CommandEnvelope:
     return CommandEnvelope(
         schema_version=RELAY_SCHEMA_VERSION,
         command_id=command_id,
-        task_id="task-1",
+        task_id=task_id,
         operation=RelayOperation.EXEC,
         correlation_id=f"correlation-{command_id}",
         declared_input_bytes=128,
@@ -341,10 +455,16 @@ async def argv_frames(command_id: str) -> AsyncIterator[bytes]:
 class NatsRelayEnvironment:
     """One fake server, one manager server, and one agent connection."""
 
-    def __init__(self, relay: BridgeRelay, state: TaskAdmissionState) -> None:
+    def __init__(
+        self,
+        relay: BridgeRelay,
+        state: TaskAdmissionState,
+        audit: CommandAudit | None = None,
+    ) -> None:
         self.server = FakeNatsServer()
         self.relay = relay
         self.repository = InMemoryCommandRepository({state.task_id: state})
+        self.audit = audit
         self.manager_connection: AsyncNatsConnection | None = None
         self.agent_connection: AsyncNatsConnection | None = None
         self.command_server: NatsCommandServer | None = None
@@ -356,7 +476,8 @@ class NatsRelayEnvironment:
         )
         await self.manager_connection.connect()
         self.command_server = NatsCommandServer(
-            self.manager_connection, command_gate(self.repository, self.relay)
+            self.manager_connection,
+            command_gate(self.repository, self.relay, self.audit),
         )
         await self.command_server.start()
         self.agent_connection = AsyncNatsConnection(
@@ -442,6 +563,216 @@ class AdmissionReplyTests(unittest.TestCase):
                 AdmissionReply.decode(bad)
 
 
+class AdmissionHandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_surfaces_admission_subscription_failure(self) -> None:
+        connection = AdmissionSetupConnection(fail_subscribe_at=1)
+        repo = InMemoryCommandRepository({"task-1": admission_state()})
+        server = NatsCommandServer(
+            connection, command_gate(repo, BridgeRelay(outputs=()))
+        )
+
+        with self.assertRaisesRegex(NatsTransportError, "subscription failure"):
+            await server.start()
+
+        self.assertIsNone(server._admit_task)
+
+    async def test_duplicate_start_is_rejected_without_another_subscription(
+        self,
+    ) -> None:
+        connection = AdmissionSetupConnection()
+        repo = InMemoryCommandRepository({"task-1": admission_state()})
+        server = NatsCommandServer(
+            connection, command_gate(repo, BridgeRelay(outputs=()))
+        )
+        await server.start()
+        try:
+            with self.assertRaisesRegex(NatsRelayError, "already started"):
+                await server.start()
+            self.assertEqual(connection.subscribe_calls, 1)
+        finally:
+            await server.stop()
+
+    async def test_start_waits_for_subscription_and_cleans_up_flush_failure(
+        self,
+    ) -> None:
+        connection = AdmissionSetupConnection(fail_flush=True)
+        repo = InMemoryCommandRepository({"task-1": admission_state()})
+        server = NatsCommandServer(
+            connection, command_gate(repo, BridgeRelay(outputs=()))
+        )
+
+        with self.assertRaisesRegex(NatsTransportError, "flush failure"):
+            await server.start()
+
+        self.assertEqual(connection.flush_calls, 1)
+        self.assertEqual(connection.unsubscribed, connection.subscriptions)
+        self.assertIsNone(server._admit_task)
+
+    async def test_output_publish_failure_settles_command_as_unknown(self) -> None:
+        connection = FailFirstOutputConnection()
+        repo = InMemoryCommandRepository({"task-1": admission_state()})
+        gate = command_gate(repo, BridgeRelay())
+        command_envelope = envelope()
+        admission = await gate.admit_detailed(_AGENT_USER, command_envelope)
+        input_sub = NatsSubscription("input.subject", 1)
+        closed_sub = NatsSubscription("closed.subject", 1)
+        closed_sub.offer(NatsMessage("closed.subject", None, b""))
+        server = NatsCommandServer(connection, gate)
+
+        await server._run_session(
+            admission,
+            command_envelope,
+            _AGENT_USER,
+            input_sub,
+            closed_sub,
+            "output.subject",
+        )
+
+        self.assertIs(await repo.outcome("command-1"), CommandOutcome.UNKNOWN)
+        terminal = decode_frame(connection.published[-1][1])
+        self.assertIsInstance(terminal, TerminalFrame)
+        assert isinstance(terminal, TerminalFrame)
+        self.assertIs(terminal.outcome, CommandOutcome.UNKNOWN)
+
+    async def test_admission_loop_continues_after_unexpected_request_fault(
+        self,
+    ) -> None:
+        repo = InMemoryCommandRepository({"task-1": admission_state()})
+        connection = AdmissionSetupConnection()
+        gate = FailFirstAdmissionGate(repo, BridgeRelay(outputs=()))
+        server = NatsCommandServer(connection, gate)
+        await server.start()
+        try:
+            admissions = connection.subscriptions[0]
+            admissions.offer(
+                NatsMessage(
+                    admission_subject(_AGENT_USER),
+                    "reply.first",
+                    encode_command_envelope(envelope("command-1")),
+                )
+            )
+            admissions.offer(
+                NatsMessage(
+                    admission_subject(_AGENT_USER),
+                    "reply.second",
+                    encode_command_envelope(envelope("command-2")),
+                )
+            )
+
+            await asyncio.wait_for(connection.published_event.wait(), timeout=1.0)
+            reply_subject, payload = connection.published[-1]
+            self.assertEqual(reply_subject, "reply.second")
+            self.assertTrue(AdmissionReply.decode(payload).admitted)
+            self.assertEqual(gate.calls, 2)
+        finally:
+            await server.stop()
+
+    async def test_input_subscription_failure_abandons_durable_admission(self) -> None:
+        repo = InMemoryCommandRepository({"task-1": admission_state()})
+        connection = AdmissionSetupConnection(fail_subscribe_at=1)
+        server = NatsCommandServer(
+            connection, command_gate(repo, BridgeRelay(outputs=()))
+        )
+
+        await server._handle_admission(
+            NatsMessage(
+                admission_subject(_AGENT_USER),
+                "reply.subject",
+                encode_command_envelope(envelope()),
+            )
+        )
+
+        self.assertIs(
+            await repo.outcome("command-1"), CommandOutcome.UNKNOWN
+        )
+        state = await repo.admission_state("task-1")
+        assert state is not None
+        self.assertIsNone(state.in_flight_command_id)
+        self.assertEqual(connection.subscriptions, [])
+
+    async def test_subscription_failure_abandons_and_cleans_partial_setup(
+        self,
+    ) -> None:
+        for fail_at, cleaned in ((1, 0), (2, 1)):
+            with self.subTest(fail_at=fail_at):
+                repo = InMemoryCommandRepository(
+                    {"task-1": admission_state()}
+                )
+                connection = AdmissionSetupConnection(
+                    fail_subscribe_at=fail_at
+                )
+                server = NatsCommandServer(
+                    connection, command_gate(repo, BridgeRelay(outputs=()))
+                )
+
+                await server._handle_admission(
+                    NatsMessage(
+                        admission_subject(_AGENT_USER),
+                        "reply.subject",
+                        encode_command_envelope(envelope()),
+                    )
+                )
+
+                self.assertIs(
+                    await repo.outcome("command-1"), CommandOutcome.UNKNOWN
+                )
+                state = await repo.admission_state("task-1")
+                assert state is not None
+                self.assertIsNone(state.in_flight_command_id)
+                self.assertEqual(len(connection.unsubscribed), cleaned)
+
+    async def test_grant_failure_abandons_and_cleans_both_subscriptions(self) -> None:
+        repo = InMemoryCommandRepository({"task-1": admission_state()})
+        connection = AdmissionSetupConnection(fail_publish=True)
+        server = NatsCommandServer(
+            connection, command_gate(repo, BridgeRelay(outputs=()))
+        )
+
+        await server._handle_admission(
+            NatsMessage(
+                admission_subject(_AGENT_USER),
+                "reply.subject",
+                encode_command_envelope(envelope()),
+            )
+        )
+
+        self.assertIs(
+            await repo.outcome("command-1"), CommandOutcome.UNKNOWN
+        )
+        self.assertEqual(len(connection.unsubscribed), 2)
+
+    async def test_setup_cancellation_abandons_and_cleans_first_subscription(
+        self,
+    ) -> None:
+        repo = InMemoryCommandRepository({"task-1": admission_state()})
+        connection = AdmissionSetupConnection(block_subscribe_at=2)
+        server = NatsCommandServer(
+            connection, command_gate(repo, BridgeRelay(outputs=()))
+        )
+        handling = asyncio.create_task(
+            server._handle_admission(
+                NatsMessage(
+                    admission_subject(_AGENT_USER),
+                    "reply.subject",
+                    encode_command_envelope(envelope()),
+                )
+            )
+        )
+        await asyncio.wait_for(connection.subscribe_blocked.wait(), timeout=1.0)
+
+        handling.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await handling
+
+        self.assertIs(
+            await repo.outcome("command-1"), CommandOutcome.UNKNOWN
+        )
+        state = await repo.admission_state("task-1")
+        assert state is not None
+        self.assertIsNone(state.in_flight_command_id)
+        self.assertEqual(len(connection.unsubscribed), 1)
+
+
 class NatsRelayFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_round_trip_streams_and_terminates(self) -> None:
         relay = BridgeRelay(outputs=((1, b"out-1"), (2, b"err-1")))
@@ -450,7 +781,7 @@ class NatsRelayFlowTests(unittest.IsolatedAsyncioTestCase):
         try:
             observed: list[tuple[int, bytes]] = []
 
-            def record(channel: int, payload: bytes) -> None:
+            async def record(channel: int, payload: bytes) -> None:
                 observed.append((channel, payload))
 
             result = await asyncio.wait_for(
@@ -734,18 +1065,214 @@ class NatsRelayFlowTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await environment.stop()
 
+    async def test_audit_failure_still_delivers_the_terminal_frame(self) -> None:
+        environment = NatsRelayEnvironment(
+            BridgeRelay(outputs=()), admission_state(), audit=FailingAudit()
+        )
+        await environment.start()
+        try:
+            result = await asyncio.wait_for(
+                environment.client().execute(
+                    envelope(), None, terminal_timeout=1.0
+                ),
+                timeout=10.0,
+            )
+
+            self.assertIs(result.outcome, CommandOutcome.SUCCESS)
+            self.assertIsNone(result.reason_code)
+            self.assertIs(
+                await environment.repository.outcome("command-1"),
+                CommandOutcome.SUCCESS,
+            )
+        finally:
+            await environment.stop()
+
 
 class NatsClientTests(unittest.IsolatedAsyncioTestCase):
+    def test_username_must_be_safe_for_an_inbox_subject(self) -> None:
+        with self.assertRaisesRegex(NatsTransportError, "single subject token"):
+            AsyncNatsConnection(
+                "127.0.0.1", 4222, "agent.unscoped", "unused", "client"
+            )
+
+    async def test_subjects_are_validated_before_transport_use(self) -> None:
+        connection = AsyncNatsConnection(
+            "127.0.0.1", 4222, "sandbox-manager", "unused", "client"
+        )
+        for subject in ("", "bad subject", "bad\r\nPING", "bad..token", "caf\N{LATIN SMALL LETTER E WITH ACUTE}"):
+            with self.subTest(subject=subject):
+                with self.assertRaises(NatsTransportError):
+                    await connection.publish(subject, b"")
+                with self.assertRaises(NatsTransportError):
+                    await connection.subscribe(subject)
+        with self.assertRaises(NatsTransportError):
+            await connection.publish("sandbox.agent.*", b"")
+        with self.assertRaises(NatsTransportError):
+            await connection.subscribe("sandbox.>.tail")
+
+    async def test_inbound_lengths_are_rejected_before_payload_reads(self) -> None:
+        connection = AsyncNatsConnection(
+            "127.0.0.1", 4222, "sandbox-manager", "unused", "client"
+        )
+        connection._reader = asyncio.StreamReader()
+        for line in (
+            f"MSG probe.subject 1 {MAX_FRAME_BYTES + 1}",
+            "MSG probe.subject 0 1",
+            "HMSG probe.subject 1 8 4",
+        ):
+            with self.subTest(line=line), self.assertRaises(NatsTransportError):
+                await connection._dispatch(line)
+
+    async def test_control_lines_and_header_messages_are_bounded(self) -> None:
+        connection = AsyncNatsConnection(
+            "127.0.0.1", 4222, "sandbox-manager", "unused", "client"
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"x" * (MAX_FRAME_BYTES + 1))
+        connection._reader = reader
+        with self.assertRaisesRegex(NatsTransportError, "control line"):
+            await connection._read_line()
+
+        with self.assertRaisesRegex(NatsTransportError, "message exceeds"):
+            await connection.publish(
+                "probe.subject", b"x" * MAX_FRAME_BYTES, headers={"A": "b"}
+            )
+
+    def test_subscription_requires_a_positive_pending_limit(self) -> None:
+        for value in (True, 0, -1):
+            with self.subTest(value=value), self.assertRaises(NatsTransportError):
+                NatsSubscription("probe.subject", value)
+
+    async def test_request_inbox_is_namespaced_by_authenticated_principal(self) -> None:
+        server = FakeNatsServer()
+        await server.start()
+        requester = AsyncNatsConnection(
+            "127.0.0.1", server.port, "agent-a", "unused", "requester"
+        )
+        responder = AsyncNatsConnection(
+            "127.0.0.1", server.port, "sandbox-manager", "unused", "responder"
+        )
+        try:
+            await requester.connect()
+            await responder.connect()
+            requests = await responder.subscribe("probe.request")
+            await responder.flush()
+
+            pending = asyncio.create_task(
+                requester.request("probe.request", b"request", timeout=1.0)
+            )
+            request = await responder.next_message(requests, timeout=1.0)
+
+            self.assertIsNotNone(request.reply)
+            assert request.reply is not None
+            self.assertRegex(
+                request.reply, r"^sandbox\.inbox\.agent-a\.[A-Za-z0-9_-]+$"
+            )
+            await responder.publish(request.reply, b"response")
+            response = await pending
+            self.assertEqual(response.payload, b"response")
+        finally:
+            await requester.close()
+            await responder.close()
+            await server.stop()
+
     async def test_wrong_credentials_are_refused_by_the_server(self) -> None:
         server = FakeNatsServer(credentials={"sandbox-manager": "secret"})
         await server.start()
+        connection = AsyncNatsConnection(
+            "127.0.0.1", server.port, "intruder", "wrong", "intruder"
+        )
         try:
-            connection = AsyncNatsConnection(
-                "127.0.0.1", server.port, "intruder", "wrong", "intruder"
-            )
             with self.assertRaises(NatsAuthError):
                 await connection.connect()
+            self.assertTrue(connection.closed)
+            self.assertIsNone(connection._writer)
+            self.assertIsNone(connection._reader_task)
+            await connection.close()
+            await connection.close()
         finally:
+            await connection.close()
+            await server.stop()
+
+    async def test_invalid_info_closes_the_peer_and_releases_streams(self) -> None:
+        peer_closed = asyncio.Event()
+
+        async def serve_invalid_info(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            writer.write(b"INFO not-json\r\n")
+            await writer.drain()
+            await reader.read()
+            peer_closed.set()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(serve_invalid_info, "127.0.0.1", 0)
+        port = cast(int, server.sockets[0].getsockname()[1])
+        connection = AsyncNatsConnection(
+            "127.0.0.1", port, "sandbox-manager", "unused", "invalid-info"
+        )
+        try:
+            with self.assertRaisesRegex(NatsTransportError, "invalid INFO"):
+                await connection.connect()
+            await asyncio.wait_for(peer_closed.wait(), timeout=1.0)
+            self.assertIsNone(connection._writer)
+            self.assertIsNone(connection._reader_task)
+        finally:
+            await connection.close()
+            server.close()
+            await server.wait_closed()
+
+    async def test_connect_timeout_releases_reader_and_writer(self) -> None:
+        peer_closed = asyncio.Event()
+
+        async def withhold_pong(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            writer.write(FakeNatsServer.info_payload())
+            await writer.drain()
+            await reader.read()
+            peer_closed.set()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(withhold_pong, "127.0.0.1", 0)
+        port = cast(int, server.sockets[0].getsockname()[1])
+        connection = AsyncNatsConnection(
+            "127.0.0.1", port, "sandbox-manager", "unused", "no-pong"
+        )
+        try:
+            with self.assertRaisesRegex(NatsAuthError, "no PONG"):
+                await connection.connect(timeout=0.05)
+            await asyncio.wait_for(peer_closed.wait(), timeout=1.0)
+            self.assertIsNone(connection._writer)
+            self.assertIsNone(connection._reader_task)
+        finally:
+            await connection.close()
+            server.close()
+            await server.wait_closed()
+
+    async def test_remote_close_disposes_streams_before_explicit_close(self) -> None:
+        server = FakeNatsServer()
+        await server.start()
+        connection = AsyncNatsConnection(
+            "127.0.0.1", server.port, "sandbox-manager", "unused", "remote-close"
+        )
+        try:
+            await connection.connect()
+            server.kill_connection("remote-close")
+            for _ in range(100):
+                if connection.closed and connection._writer is None:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertTrue(connection.closed)
+            self.assertIsNone(connection._writer)
+            self.assertIsNone(connection._reader_task)
+            await connection.close()
+            await connection.close()
+        finally:
+            await connection.close()
             await server.stop()
 
     async def test_slow_consumer_drops_instead_of_growing(self) -> None:

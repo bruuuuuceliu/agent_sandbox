@@ -9,7 +9,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Protocol
 
-from .kubernetes import sandbox_resource_name
+from .kubernetes import TASK_ANNOTATION, sandbox_resource_name
 
 
 class KubernetesLifecycleError(RuntimeError):
@@ -243,7 +243,7 @@ def _validate_ownership(observed: ObservedObject, task_id: str) -> None:
     task_hash = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:32]
     if (
         reference.name not in expected_names
-        or observed.annotations.get("sandbox-manager.io/task-id") != task_id
+        or observed.annotations.get(TASK_ANNOTATION) != task_id
         or observed.labels.get("app.kubernetes.io/instance") != expected_name
         or observed.labels.get("app.kubernetes.io/managed-by") != "sandbox-manager"
         or observed.labels.get("sandbox-manager.io/task-hash") != task_hash

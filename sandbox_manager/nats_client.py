@@ -1,7 +1,7 @@
 """A minimal asyncio Core NATS client for the manager transports.
 
-Promotes the Stage 4a spike client to asyncio with the same deliberate
-limitations: basic authentication, no TLS, no JetStream management
+The client has deliberate limitations: basic authentication, no TLS, no
+JetStream management
 convenience layer, no cluster failover, and at-most-once delivery. Slow
 consumers drop rather than grow: each subscription holds a bounded queue and
 counts what it discarded. Header messages (``HPUB``/``HMSG``) are supported
@@ -22,9 +22,12 @@ import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from .identifiers import is_identifier
 from .relay_protocol import MAX_FRAME_BYTES
 
 _CONNECT_TIMEOUT = 5.0
+
+_MAX_CONTROL_LINE_BYTES = 64 * 1024
 
 _INBOX_PREFIX = "sandbox.inbox"
 
@@ -53,6 +56,8 @@ class NatsMessage:
 
 class NatsSubscription:
     def __init__(self, subject: str, pending_limit: int) -> None:
+        if type(pending_limit) is not int or pending_limit <= 0:
+            raise NatsTransportError("pending limit must be a positive integer")
         self.subject = subject
         self.queue: asyncio.Queue[NatsMessage] = asyncio.Queue()
         self.pending_limit = pending_limit
@@ -76,6 +81,10 @@ class AsyncNatsConnection:
         password: str,
         name: str,
     ) -> None:
+        if not is_identifier(username):
+            raise NatsTransportError(
+                "NATS username must be a short single subject token"
+            )
         self._host = host
         self._port = port
         self._username = username
@@ -110,54 +119,68 @@ class AsyncNatsConnection:
         return self._closed
 
     async def connect(self, timeout: float = _CONNECT_TIMEOUT) -> None:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(self._host, self._port), timeout=timeout
-        )
-        self._reader = reader
-        self._writer = writer
-
-        info_line = await self._read_line()
-        if not info_line.startswith("INFO "):
-            await self._teardown()
-            raise NatsTransportError("server did not send INFO first")
-        info = json.loads(info_line[5:])
-        self._max_payload = int(info.get("max_payload", MAX_FRAME_BYTES))
-
-        self._reader_task = asyncio.create_task(
-            self._read_loop(), name=f"nats-read-{self._name}"
-        )
-
-        options = {
-            "user": self._username,
-            "pass": self._password,
-            "verbose": False,
-            "pedantic": False,
-            "tls_required": False,
-            "headers": True,
-            "no_responders": True,
-            "name": self._name,
-            "protocol": 1,
-            "lang": "py-sandbox-manager",
-            "version": "0.1",
-        }
-        await self._send(
-            f"CONNECT {json.dumps(options, separators=(',', ':'))}\r\nPING\r\n".encode(
-                "ascii"
-            )
-        )
-
         try:
-            await asyncio.wait_for(self._pong.wait(), timeout=timeout)
-        except TimeoutError as error:
-            raise NatsAuthError("no PONG after CONNECT") from error
-        if self._error is not None:
-            raise NatsAuthError(self._error)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self._host, self._port), timeout=timeout
+            )
+            self._reader = reader
+            self._writer = writer
+
+            info_line = await self._read_line()
+            if not info_line.startswith("INFO "):
+                raise NatsTransportError("server did not send INFO first")
+            try:
+                info = json.loads(info_line[5:])
+                if not isinstance(info, dict):
+                    raise TypeError
+                max_payload = info.get("max_payload", MAX_FRAME_BYTES)
+                if type(max_payload) is not int or max_payload <= 0:
+                    raise TypeError
+                self._max_payload = max_payload
+            except (TypeError, json.JSONDecodeError) as error:
+                raise NatsTransportError("server sent invalid INFO") from error
+
+            self._reader_task = asyncio.create_task(
+                self._read_loop(), name=f"nats-read-{self._name}"
+            )
+
+            options = {
+                "user": self._username,
+                "pass": self._password,
+                "verbose": False,
+                "pedantic": False,
+                "tls_required": False,
+                "headers": True,
+                "no_responders": True,
+                "name": self._name,
+                "protocol": 1,
+                "lang": "py-sandbox-manager",
+                "version": "0.1",
+            }
+            await self._send(
+                f"CONNECT {json.dumps(options, separators=(',', ':'))}\r\nPING\r\n".encode(
+                    "ascii"
+                )
+            )
+
+            try:
+                await asyncio.wait_for(self._pong.wait(), timeout=timeout)
+            except TimeoutError as error:
+                raise NatsAuthError("no PONG after CONNECT") from error
+            if self._error is not None:
+                raise NatsAuthError(self._error)
+        except BaseException:
+            self._closed = True
+            await self._stop_reader()
+            await self._teardown()
+            raise
 
     async def subscribe(
         self, subject: str, pending_limit: int = 64
     ) -> NatsSubscription:
         if self._closed:
             raise NatsClosedError("connection is closed")
+        _validate_subject(subject, allow_wildcards=True)
         self._next_sid += 1
         sid = self._next_sid
         subscription = NatsSubscription(subject, pending_limit)
@@ -179,6 +202,9 @@ class AsyncNatsConnection:
         reply: str | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> None:
+        _validate_subject(subject, allow_wildcards=False)
+        if reply is not None:
+            _validate_subject(reply, allow_wildcards=False)
         if len(payload) > self._max_payload:
             raise NatsTransportError("payload exceeds server max_payload")
         if len(payload) > MAX_FRAME_BYTES:
@@ -192,6 +218,10 @@ class AsyncNatsConnection:
             return
         encoded_headers = encode_headers(headers)
         total = len(encoded_headers) + len(payload)
+        if total > self._max_payload:
+            raise NatsTransportError("message exceeds server max_payload")
+        if total > MAX_FRAME_BYTES:
+            raise NatsTransportError("message exceeds relay frame bound")
         header = (
             f"HPUB {subject}{reply_part} {len(encoded_headers)} {total}\r\n"
         ).encode("ascii")
@@ -216,7 +246,7 @@ class AsyncNatsConnection:
     ) -> NatsMessage:
         """Publish one request and wait for a single reply on a fresh inbox."""
 
-        inbox = f"{_INBOX_PREFIX}.{secrets.token_urlsafe(12)}"
+        inbox = f"{_INBOX_PREFIX}.{self._username}.{secrets.token_urlsafe(12)}"
         subscription = await self.subscribe(inbox, pending_limit=8)
         try:
             await self.publish(subject, payload, reply=inbox, headers=headers)
@@ -243,12 +273,8 @@ class AsyncNatsConnection:
             ) from error
 
     async def close(self) -> None:
-        if self._closed:
-            return
         self._closed = True
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            await asyncio.gather(self._reader_task, return_exceptions=True)
+        await self._stop_reader()
         await self._teardown()
 
     async def _read_loop(self) -> None:
@@ -264,18 +290,24 @@ class AsyncNatsConnection:
                     self._pong.set()
                 elif operator in ("MSG", "HMSG"):
                     await self._dispatch(line)
+                    if self._error is not None:
+                        return
                 elif operator.startswith("-ERR"):
                     self._error = line
                     self._pong.set()
                     return
-        except (OSError, NatsClosedError, asyncio.CancelledError):
+        except asyncio.CancelledError:
             return
+        except (OSError, NatsClosedError):
+            return
+        except Exception as error:  # noqa: BLE001 - protocol parsing fails closed
+            self._error = f"protocol_error:{type(error).__name__}"
+            self._pong.set()
         finally:
-            # Whatever ended the read loop — server drop, protocol error, or
-            # local close — this connection can no longer carry frames, so
-            # publishers must fail closed instead of writing into a socket
-            # nobody will read.
             self._closed = True
+            if self._reader_task is asyncio.current_task():
+                self._reader_task = None
+            await self._teardown()
 
     async def _dispatch(self, line: str) -> None:
         parts = line.split()
@@ -305,6 +337,10 @@ class AsyncNatsConnection:
             return
         sid = int(sid_text)
         size = int(size_text)
+        if sid <= 0 or size < 0 or size > MAX_FRAME_BYTES:
+            raise NatsTransportError("invalid inbound message size or subscription ID")
+        if header_size < 0 or header_size > size:
+            raise NatsTransportError("invalid inbound header size")
         if header_size:
             encoded_headers = await self._read_exact(header_size)
             headers = parse_headers(encoded_headers)
@@ -316,16 +352,24 @@ class AsyncNatsConnection:
 
     async def _read_line(self) -> str:
         assert self._reader is not None
-        while b"\r\n" not in self._buf:
+        while True:
+            delimiter = self._buf.find(b"\r\n")
+            if delimiter >= 0:
+                if delimiter > _MAX_CONTROL_LINE_BYTES:
+                    raise NatsTransportError("NATS control line exceeds bound")
+                line, self._buf = self._buf[:delimiter], self._buf[delimiter + 2 :]
+                return line.decode("ascii", "replace")
+            if len(self._buf) > _MAX_CONTROL_LINE_BYTES:
+                raise NatsTransportError("NATS control line exceeds bound")
             chunk = await self._reader.read(65536)
             if not chunk:
                 raise NatsClosedError("connection closed")
             self._buf += chunk
-        line, _, self._buf = self._buf.partition(b"\r\n")
-        return line.decode("ascii", "replace")
 
     async def _read_exact(self, size: int) -> bytes:
         assert self._reader is not None
+        if size < 0 or size > MAX_FRAME_BYTES:
+            raise NatsTransportError("NATS payload size exceeds bound")
         while len(self._buf) < size:
             chunk = await self._reader.read(65536)
             if not chunk:
@@ -343,12 +387,23 @@ class AsyncNatsConnection:
             await self._writer.drain()
 
     async def _teardown(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
-            try:
-                await self._writer.wait_closed()
-            except (OSError, asyncio.CancelledError):
-                pass
+        writer = self._writer
+        self._reader = None
+        self._writer = None
+        self._buf = b""
+        if writer is None:
+            return
+        writer.close()
+        with contextlib.suppress(OSError, asyncio.CancelledError):
+            await writer.wait_closed()
+
+    async def _stop_reader(self) -> None:
+        task = self._reader_task
+        self._reader_task = None
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def encode_headers(headers: Mapping[str, str]) -> bytes:
@@ -363,6 +418,25 @@ def encode_headers(headers: Mapping[str, str]) -> bytes:
         lines.append(f"{key}: {value}".encode("ascii"))
     lines.append(b"")
     return b"\r\n".join(lines) + b"\r\n"
+
+
+def _validate_subject(subject: str, *, allow_wildcards: bool) -> None:
+    if not isinstance(subject, str) or not subject:
+        raise NatsTransportError("NATS subject is required")
+    try:
+        subject.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise NatsTransportError("NATS subject must be ASCII") from error
+    tokens = subject.split(".")
+    for index, token in enumerate(tokens):
+        if not token or any(ord(character) < 33 or ord(character) > 126 for character in token):
+            raise NatsTransportError("NATS subject contains an invalid token")
+        if token == "*" and allow_wildcards:
+            continue
+        if token == ">" and allow_wildcards and index == len(tokens) - 1:
+            continue
+        if "*" in token or ">" in token:
+            raise NatsTransportError("NATS subject contains an invalid wildcard")
 
 
 def parse_headers(block: bytes) -> dict[str, str]:

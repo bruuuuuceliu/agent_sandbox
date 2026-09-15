@@ -45,3 +45,16 @@ another service.
 `local.config` also defines `NATS_CLIENT_PORT` and `NATS_MONITOR_PORT`. These
 are non-secret host ports consumed by the local dependency scripts and are not
 required manager settings in development or production.
+
+The local NATS identities are fixed by `examples/local/nats-server.conf` so
+their subject permissions cannot drift from their authenticated principals.
+Set separate `NATS_MANAGER_PASSWORD` and `NATS_AGENT_PASSWORD` secrets in
+`local.env`; the corresponding usernames are `sandbox-manager` and
+`sandbox-agent-local`. Development and production still inject the manager's
+`NATS_USERNAME` and `NATS_PASSWORD` through their environment-specific secret
+stores.
+
+`NATS_URL` accepts only the implemented plain Core NATS transport: `nats://`
+with a subject-safe username, a non-empty password, a hostname, and an explicit
+port. TLS and WebSocket schemes are rejected until those transports are
+implemented rather than being accepted without their required handling.

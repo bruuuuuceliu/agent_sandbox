@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import posixpath
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Protocol
 
+from .identifiers import is_identifier
 from .provisioning import ProvisionedSandbox, ProvisioningTask
 
 Manifest = dict[str, object]
@@ -18,6 +20,8 @@ CPU_REQUEST = "250m"
 MEMORY_REQUEST = "256Mi"
 CPU_LIMIT = "1"
 MEMORY_LIMIT = "512Mi"
+TASK_ANNOTATION = "sandbox-manager.io/task-id"
+WORKSPACE_MOUNT_PATH = "/workspace"
 
 _DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _DNS_SUBDOMAIN_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
@@ -39,6 +43,10 @@ class SandboxWorkload:
     storage_class_name: str
     result_storage: str
     results_mount_path: str
+    cpu_request: str = CPU_REQUEST
+    memory_request: str = MEMORY_REQUEST
+    cpu_limit: str = CPU_LIMIT
+    memory_limit: str = MEMORY_LIMIT
 
     def __post_init__(self) -> None:
         _validate_dns_label(self.namespace, "namespace")
@@ -59,6 +67,20 @@ class SandboxWorkload:
             )
         if not _valid_absolute_path(self.results_mount_path):
             raise KubernetesResourceError("results mount path must be absolute")
+        if _mount_paths_overlap(self.results_mount_path, WORKSPACE_MOUNT_PATH):
+            raise KubernetesResourceError(
+                "results mount path must not overlap the workspace"
+            )
+        for value, field_name in (
+            (self.cpu_request, "CPU request"),
+            (self.memory_request, "memory request"),
+            (self.cpu_limit, "CPU limit"),
+            (self.memory_limit, "memory limit"),
+        ):
+            if not _valid_text(value):
+                raise KubernetesResourceError(
+                    f"{field_name} must be a non-empty string"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +127,10 @@ class KubernetesProvisionerConfig:
     storage_class_name: str
     result_storage: str
     readiness_timeout: timedelta
+    cpu_request: str = CPU_REQUEST
+    memory_request: str = MEMORY_REQUEST
+    cpu_limit: str = CPU_LIMIT
+    memory_limit: str = MEMORY_LIMIT
 
     def __post_init__(self) -> None:
         _validate_dns_label(self.namespace, "namespace")
@@ -116,6 +142,16 @@ class KubernetesProvisionerConfig:
             )
         if self.readiness_timeout <= timedelta(0):
             raise KubernetesResourceError("readiness timeout must be positive")
+        for value, field_name in (
+            (self.cpu_request, "CPU request"),
+            (self.memory_request, "memory request"),
+            (self.cpu_limit, "CPU limit"),
+            (self.memory_limit, "memory limit"),
+        ):
+            if not _valid_text(value):
+                raise KubernetesResourceError(
+                    f"{field_name} must be a non-empty string"
+                )
 
 
 class KubernetesSandboxProvisioner:
@@ -139,6 +175,10 @@ class KubernetesSandboxProvisioner:
                 storage_class_name=self._config.storage_class_name,
                 result_storage=self._config.result_storage,
                 results_mount_path=profile.results_mount_path,
+                cpu_request=self._config.cpu_request,
+                memory_request=self._config.memory_request,
+                cpu_limit=self._config.cpu_limit,
+                memory_limit=self._config.memory_limit,
             )
         )
         applied = await apply_sandbox_resources(self._client, resources)
@@ -265,10 +305,13 @@ def build_sandbox_resources(workload: SandboxWorkload) -> SandboxResources:
                     "command": list(workload.command),
                     "resources": {
                         "requests": {
-                            "cpu": CPU_REQUEST,
-                            "memory": MEMORY_REQUEST,
+                            "cpu": workload.cpu_request,
+                            "memory": workload.memory_request,
                         },
-                        "limits": {"cpu": CPU_LIMIT, "memory": MEMORY_LIMIT},
+                        "limits": {
+                            "cpu": workload.cpu_limit,
+                            "memory": workload.memory_limit,
+                        },
                     },
                     "securityContext": {
                         "allowPrivilegeEscalation": False,
@@ -279,6 +322,10 @@ def build_sandbox_resources(workload: SandboxWorkload) -> SandboxResources:
                     },
                     "volumeMounts": [
                         {
+                            "mountPath": WORKSPACE_MOUNT_PATH,
+                            "name": "workspace",
+                        },
+                        {
                             "mountPath": workload.results_mount_path,
                             "name": "results",
                         },
@@ -286,6 +333,7 @@ def build_sandbox_resources(workload: SandboxWorkload) -> SandboxResources:
                 }
             ],
             "volumes": [
+                {"name": "workspace", "emptyDir": {}},
                 {
                     "name": "results",
                     "persistentVolumeClaim": {"claimName": name},
@@ -321,7 +369,7 @@ def _metadata(
     labels: Mapping[str, str],
     annotations: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
-    resource_annotations = {"sandbox-manager.io/task-id": workload.task_id}
+    resource_annotations = {TASK_ANNOTATION: workload.task_id}
     if annotations is not None:
         resource_annotations.update(annotations)
     return {
@@ -333,12 +381,7 @@ def _metadata(
 
 
 def _validate_task_id(value: str) -> None:
-    if (
-        not value
-        or value != value.strip()
-        or len(value.encode("utf-8")) > 128
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
-    ):
+    if not is_identifier(value):
         raise KubernetesResourceError("task ID is invalid")
 
 
@@ -367,6 +410,16 @@ def _valid_text(value: object) -> bool:
 
 def _valid_absolute_path(value: str) -> bool:
     return _valid_text(value) and value.startswith("/")
+
+
+def _mount_paths_overlap(first: str, second: str) -> bool:
+    first = posixpath.normpath(first)
+    second = posixpath.normpath(second)
+    return (
+        first == second
+        or first.startswith(f"{second.rstrip('/')}/")
+        or second.startswith(f"{first.rstrip('/')}/")
+    )
 
 
 def _valid_dns_subdomain(value: str) -> bool:

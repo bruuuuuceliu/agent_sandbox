@@ -66,14 +66,14 @@ evaluation fields and default-denies everything else.
 
 ## Evidence
 
-Local verification, 2026-08-30 (Python 3.12.13, stdlib only, `PYTHONPATH=src`):
+Local verification, 2026-08-30 (Python 3.12.13, stdlib only):
 
 - `python3 -m pytest -q` — 229 tests and 64 subtests passed (112 pre-existing
   plus 117 new across relay protocol, command policy, admission, workspace,
   and the Kubernetes exec client).
-- `python3 -m ruff check src tests examples/spikes` — all checks passed.
-- `python3 -m mypy --strict src tests` — no issues in 39 source files.
-- `PYTHONPATH=src python3 examples/spikes/nats_relay_spike.py` — 9/9 scenarios
+- `python3 -m ruff check sandbox_manager tests examples/spikes` — all checks passed.
+- `python3 -m mypy --strict sandbox_manager tests` — no issues in 39 source files.
+- `python3 -m examples.spikes.nats_relay_spike` — 9/9 scenarios
   passed against the live local container (127.0.0.1:15181, nats:2.11-alpine
   with single-user basic auth). Five consecutive runs were clean after one
   transient failure in the reconnect scenario exposed a scenario race (the

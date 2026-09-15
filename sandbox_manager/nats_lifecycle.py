@@ -25,9 +25,9 @@ JetStream for exactly those two flows and nothing else:
 The transport principal comes from the subject alone, exactly as the
 command relay recovers it: a spawn published on
 ``sandbox.agent.<principal>.spawn`` whose payload names a different agent
-session is a poison message, not evidence of ownership (Decision 22).
+session is a poison message, not evidence of ownership.
 
-Ready responses carry identifiers and relay routing only (Decision 4): task,
+Ready responses carry identifiers and relay routing only: task,
 request, agent session, profile type, relay protocol version and admission
 route, and the sandbox/result-volume references and UIDs. No endpoint, no
 credential, no payload data.
@@ -50,15 +50,16 @@ from .commands import (
     CommandEventKind,
     InMemoryCommandRepository,
 )
+from .identifiers import is_identifier
 from .intake import IdentifierConflictError, SpawnIntakeProcessor, TaskRepository
 from .nats_client import (
     AsyncNatsConnection,
     NatsMessage,
     NatsTransportError,
 )
-from .nats_relay import NatsRelayError, require_subject_token
+from .nats_relay import NatsRelayError, admission_subject, require_subject_token
 from .provisioning import ReadyTask
-from .relay_protocol import CommandOutcome
+from .relay_protocol import RELAY_SCHEMA_VERSION, CommandOutcome
 from .spawn import SpawnRequestError, decode_spawn_request
 
 #: Document schema of one ready response (independent of the relay schema).
@@ -147,6 +148,7 @@ def principal_from_ready_subject(subject: str) -> str:
         or tokens[5] != "ready"
     ):
         raise NatsLifecycleError(f"not a ready subject: {subject}")
+    _require_token(tokens[4], "task_id")
     return _require_token(tokens[2], "principal")
 
 
@@ -165,6 +167,35 @@ class ReadyResponse:
     sandbox_uid: str
     result_volume_reference: str
     result_volume_uid: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != READY_SCHEMA_VERSION:
+            raise NatsLifecycleError("unsupported ready response schema version")
+        if (
+            type(self.relay_protocol_version) is not int
+            or self.relay_protocol_version != RELAY_SCHEMA_VERSION
+        ):
+            raise NatsLifecycleError("unsupported relay protocol version")
+        for value, field in (
+            (self.task_id, "task_id"),
+            (self.request_id, "request_id"),
+            (self.agent_session_id, "agent_session_id"),
+        ):
+            if not is_identifier(value):
+                raise NatsLifecycleError(
+                    f"ready response field {field} must be a valid identifier"
+                )
+        for value, field in (
+            (self.sandbox_type, "sandbox_type"),
+            (self.relay_route, "relay_route"),
+            (self.sandbox_reference, "sandbox_reference"),
+            (self.sandbox_uid, "sandbox_uid"),
+            (self.result_volume_reference, "result_volume_reference"),
+            (self.result_volume_uid, "result_volume_uid"),
+        ):
+            _require_document_text(value, f"ready response field {field}")
+        if self.relay_route != admission_subject(self.agent_session_id):
+            raise NatsLifecycleError("ready response relay route does not match its owner")
 
 
 _RESPONSE_FIELDS = frozenset(
@@ -211,7 +242,7 @@ def decode_ready_response(payload: bytes) -> ReadyResponse:
     """Decode and validate one ready response."""
 
     try:
-        decoded = json.loads(payload.decode("utf-8"))
+        decoded = json.loads(payload.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise NatsLifecycleError("ready response must be UTF-8 JSON") from error
     if not isinstance(decoded, dict):
@@ -219,21 +250,29 @@ def decode_ready_response(payload: bytes) -> ReadyResponse:
     values: Mapping[str, object] = decoded
     if set(values) != _RESPONSE_FIELDS:
         raise NatsLifecycleError("ready response fields do not match the schema")
-    if values["schema_version"] != READY_SCHEMA_VERSION:
+    if (
+        type(values["schema_version"]) is not int
+        or values["schema_version"] != READY_SCHEMA_VERSION
+    ):
         raise NatsLifecycleError("unsupported ready response schema version")
     for field in _RESPONSE_FIELDS - {"schema_version", "relay_protocol_version"}:
         value = values[field]
         if not isinstance(value, str) or not value:
             raise NatsLifecycleError(f"ready response field {field} must be text")
-    if type(values["relay_protocol_version"]) is not int:
-        raise NatsLifecycleError("relay protocol version must be an integer")
+    relay_protocol_version = values["relay_protocol_version"]
+    if (
+        type(relay_protocol_version) is not int
+        or relay_protocol_version != RELAY_SCHEMA_VERSION
+    ):
+        raise NatsLifecycleError("unsupported relay protocol version")
+    assert isinstance(relay_protocol_version, int)
     return ReadyResponse(
         schema_version=READY_SCHEMA_VERSION,
         task_id=str(values["task_id"]),
         request_id=str(values["request_id"]),
         agent_session_id=str(values["agent_session_id"]),
         sandbox_type=str(values["sandbox_type"]),
-        relay_protocol_version=int(values["relay_protocol_version"]),
+        relay_protocol_version=relay_protocol_version,
         relay_route=str(values["relay_route"]),
         sandbox_reference=str(values["sandbox_reference"]),
         sandbox_uid=str(values["sandbox_uid"]),
@@ -244,8 +283,8 @@ def decode_ready_response(payload: bytes) -> ReadyResponse:
 
 def _decode_api_document(payload: bytes, source: str) -> dict[str, object]:
     try:
-        decoded = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as failure:
+        decoded = json.loads(payload.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, NatsLifecycleError) as failure:
         raise JetStreamError(f"invalid JetStream response from {source}") from failure
     if not isinstance(decoded, dict):
         raise JetStreamError(f"invalid JetStream response from {source}")
@@ -295,13 +334,14 @@ def decode_command_event(payload: bytes) -> CommandEvent:
     """Decode and validate one journal event, failing closed on drift."""
 
     try:
-        decoded = json.loads(payload.decode("utf-8"))
+        decoded = json.loads(payload.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise NatsLifecycleError("command event must be UTF-8 JSON") from error
     if not isinstance(decoded, dict):
         raise NatsLifecycleError("command event must be a JSON object")
     values: Mapping[str, object] = decoded
-    if values.get("schema_version") != COMMAND_EVENT_SCHEMA_VERSION:
+    schema_version = values.get("schema_version")
+    if type(schema_version) is not int or schema_version != COMMAND_EVENT_SCHEMA_VERSION:
         raise NatsLifecycleError("unsupported command event schema version")
     try:
         kind = CommandEventKind(str(values.get("kind", "")))
@@ -321,7 +361,10 @@ def decode_command_event(payload: bytes) -> CommandEvent:
             if not isinstance(value, str) or not value:
                 raise NatsLifecycleError(f"command event field {field} must be text")
             arguments[field] = value
-    return CommandEvent(kind=kind, **arguments)
+    try:
+        return CommandEvent(kind=kind, **arguments)
+    except (TypeError, ValueError) as error:
+        raise NatsLifecycleError("command event fields are invalid") from error
 
 
 def _event_datetime(value: object, field: str) -> datetime:
@@ -343,6 +386,22 @@ def _event_outcome(value: object) -> CommandOutcome:
         return CommandOutcome(value)
     except ValueError as error:
         raise NatsLifecycleError("unknown command outcome") from error
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key, value in pairs:
+        if key in values:
+            raise NatsLifecycleError(f"duplicate JSON field: {key}")
+        values[key] = value
+    return values
+
+
+def _require_document_text(value: object, field: str) -> None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise NatsLifecycleError(f"{field} must be text")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise NatsLifecycleError(f"{field} contains invalid text")
 
 
 class JetStream:
@@ -492,6 +551,15 @@ class JetStream:
         except JetStreamApiError as failure:
             if "not found" not in failure.description:
                 raise
+
+    async def consumer_pending(self, stream: str, consumer: str) -> int:
+        """Return the server's authoritative pending count for one consumer."""
+
+        info = await self._api(f"CONSUMER.INFO.{stream}.{consumer}")
+        pending = info.get("num_pending")
+        if type(pending) is not int or pending < 0:
+            raise JetStreamError("consumer info carries no valid pending count")
+        return pending
 
     async def publish(
         self,
@@ -660,6 +728,8 @@ class JetStreamSpawnIntake:
     async def start(self) -> None:
         """Ensure the stream and durable consumer exist, then consume."""
 
+        if self._task is not None:
+            raise NatsLifecycleError("spawn intake is already started")
         await self._jetstream.ensure_stream(self._stream, self._subjects)
         await self._jetstream.ensure_consumer(
             self._stream,
@@ -701,23 +771,30 @@ class JetStreamSpawnIntake:
             principal = principal_from_spawn_subject(delivery.subject)
             request = decode_spawn_request(delivery.payload)
         except (NatsLifecycleError, SpawnRequestError):
-            await delivery.terminate()
-            self._observer.poisoned(delivery.subject, "invalid_request")
+            await self._terminate_poison(delivery, "invalid_request")
             return
         if request.agent_session_id != principal:
-            await delivery.terminate()
-            self._observer.poisoned(delivery.subject, "principal_mismatch")
+            await self._terminate_poison(delivery, "principal_mismatch")
             return
         try:
             await processor.process(_SpawnDelivery(delivery))
         except IdentifierConflictError:
-            await delivery.terminate()
-            self._observer.poisoned(delivery.subject, "identifier_conflict")
+            await self._terminate_poison(delivery, "identifier_conflict")
         except Exception as failure:  # noqa: BLE001 - unknown failures redeliver
             # Transport, repository-persistence, or unknown failures cannot be
             # classified as poison: redeliver on a delay, bounded by the
             # consumer's max_deliver.
             await self._redeliver(delivery, type(failure).__name__)
+
+    async def _terminate_poison(
+        self, delivery: JetStreamMessage, reason: str
+    ) -> None:
+        try:
+            await delivery.terminate()
+        except (JetStreamError, NatsTransportError):
+            await self._redeliver(delivery, f"{reason}:term_lost")
+            return
+        self._observer.poisoned(delivery.subject, reason)
 
     async def _redeliver(self, delivery: JetStreamMessage, reason: str) -> None:
         try:
@@ -830,7 +907,12 @@ class JetStreamCommandEventJournal:
                     self._stream, consumer, wait_seconds=self._pull_wait_seconds
                 )
                 if delivery is None:
-                    return count
+                    if (
+                        await self._jetstream.consumer_pending(self._stream, consumer)
+                        == 0
+                    ):
+                        return count
+                    continue
                 try:
                     event = decode_command_event(delivery.payload)
                 except NatsLifecycleError as failure:

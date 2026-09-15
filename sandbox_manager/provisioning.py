@@ -67,8 +67,8 @@ class ProvisionedSandbox:
 class RelayReference:
     """Where the owning agent session sends commands for one task.
 
-    Carries the relay protocol version and the admission route; by Decision 4
-    it never carries a sandbox endpoint or a sandbox credential.
+    Carries the relay protocol version and admission route without exposing a
+    sandbox endpoint or credential.
     """
 
     protocol_version: int

@@ -1,7 +1,7 @@
 """Stage 4a spike: authenticated Core NATS command-relay feasibility.
 
 Answers the Stage 4a transport questions against the real local server
-(``examples/local/compose.yaml``, nats:2.11 with single-user auth):
+(``examples/local/compose.yaml``, nats:2.11 with separate manager/agent ACLs):
 
 1. Basic-auth CONNECT binds the transport principal; wrong credentials are
    refused by the server, not by application code.
@@ -19,7 +19,7 @@ Answers the Stage 4a transport questions against the real local server
 
 Run with the local container up:
 
-    PYTHONPATH=src python3 examples/spikes/nats_relay_spike.py
+    python3 -m examples.spikes.nats_relay_spike
 
 Credentials come from ``config/local.env`` (git-ignored, local only). Evidence
 lines are payload-free: identifiers, sizes, counts, and outcomes only.
@@ -27,12 +27,14 @@ lines are payload-free: identifiers, sizes, counts, and outcomes only.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import secrets
 import socket
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,7 +57,9 @@ from sandbox_manager.relay_protocol import (
 _HOST = "127.0.0.1"
 _PORT = 15181
 _CONNECT_TIMEOUT = 5.0
-_ADMIT_SUBJECT = "sandbox.spike.command.admit"
+_MANAGER_USER = "sandbox-manager"
+_AGENT_USER = "sandbox-agent-local"
+_ADMIT_SUBJECT = f"sandbox.agent.{_AGENT_USER}.admit"
 
 
 class SpikeNatsError(RuntimeError):
@@ -212,7 +216,7 @@ class NatsConnection:
     def request(self, subject: str, payload: bytes, timeout: float) -> SpikeMsg:
         """Publish one request and wait for a single reply on a fresh inbox."""
 
-        inbox = f"sandbox.spike.inbox.{secrets.token_urlsafe(12)}"
+        inbox = f"sandbox.inbox.{self.principal}.{secrets.token_urlsafe(12)}"
         sid = self.subscribe(inbox, pending=8)
         try:
             self.publish(subject, payload, reply=inbox)
@@ -249,10 +253,8 @@ class NatsConnection:
     def close(self) -> None:
         self._closed.set()
         if self._sock is not None:
-            try:
+            with contextlib.suppress(OSError):
                 self._sock.close()
-            except OSError:
-                pass
         if self._reader is not None:
             self._reader.join(timeout=2.0)
         self._wake_all()
@@ -340,8 +342,8 @@ class NatsConnection:
 _TASK_OWNERS = {
     # The admission responder maps tasks to the principal that owns them.
     # ``task-other`` deliberately belongs to a different agent session so the
-    # spike can prove the transport principal decides, not the payload.
-    "task-1": "sandbox-local",
+    # spike can prove the ACL-scoped subject principal decides, not the payload.
+    "task-1": _AGENT_USER,
     "task-other": "agent-other",
 }
 
@@ -349,14 +351,18 @@ _TASK_OWNERS = {
 class AdmissionResponder(threading.Thread):
     """Serves admission requests, deciding ownership from the connection user."""
 
-    def __init__(self, connection: NatsConnection) -> None:
+    def __init__(self, connection: NatsConnection, request_principal: str) -> None:
         super().__init__(name="spike-admission-responder", daemon=True)
         self._connection = connection
+        self._request_principal = request_principal
         self._stop = threading.Event()
+        self.ready = threading.Event()
         self.handled: list[dict[str, str | None]] = []
 
     def run(self) -> None:
         sid = self._connection.subscribe(_ADMIT_SUBJECT, pending=16)
+        self._connection.flush()
+        self.ready.set()
         while not self._stop.is_set():
             try:
                 message = self._connection.next_msg(sid, 0.25)
@@ -365,8 +371,12 @@ class AdmissionResponder(threading.Thread):
             except SpikeNatsClosed:
                 break
             decision, task_id = self._decide(message.payload)
+            refusal = decision.get("refusal")
             self.handled.append(
-                {"task_id": task_id, "refusal": decision.get("refusal")}
+                {
+                    "task_id": task_id,
+                    "refusal": refusal if isinstance(refusal, str) else None,
+                }
             )
             if message.reply:
                 self._connection.publish(
@@ -384,7 +394,7 @@ class AdmissionResponder(threading.Thread):
         owner = _TASK_OWNERS.get(envelope.task_id)
         if owner is None:
             decision = {"admitted": False, "refusal": "unknown_task"}
-        elif owner != self._connection.principal:
+        elif owner != self._request_principal:
             decision = {"admitted": False, "refusal": "wrong_principal"}
         else:
             decision = {"admitted": True, "refusal": None}
@@ -437,15 +447,17 @@ def scenario_rejects_wrong_credentials(username: str) -> list[str]:
     raise AssertionError("server accepted a wrong password")
 
 
-def scenario_transport_cap_fits_frames(username: str, password: str) -> list[str]:
-    connection = NatsConnection(_HOST, _PORT, username, password, "cap")
+def scenario_transport_cap_fits_frames(agent_password: str) -> list[str]:
+    connection = NatsConnection(
+        _HOST, _PORT, _AGENT_USER, agent_password, "cap-agent"
+    )
     connection.connect()
     try:
         if connection.max_payload < MAX_FRAME_BYTES:
             raise AssertionError(
                 f"server max_payload {connection.max_payload} below frame bound"
             )
-        subject = f"sandbox.spike.cap.{secrets.token_urlsafe(6)}"
+        subject = f"sandbox.agent.{_AGENT_USER}.task.task-1.command-cap.in"
         largest = DataFrame(
             "command-cap", DataChannel.STDOUT, 0, b"a" * (MAX_FRAME_BYTES - 64)
         )
@@ -459,9 +471,7 @@ def scenario_transport_cap_fits_frames(username: str, password: str) -> list[str
         connection.close()
 
 
-def scenario_admission_round_trip(
-    connection: NatsConnection, responder: AdmissionResponder
-) -> list[str]:
+def scenario_admission_round_trip(connection: NatsConnection) -> list[str]:
     envelope = _envelope("task-1", "command-roundtrip")
     reply = connection.request(
         _ADMIT_SUBJECT, encode_command_envelope(envelope), timeout=5.0
@@ -472,14 +482,12 @@ def scenario_admission_round_trip(
     assert decoded == envelope
     return [
         "admission request/reply admitted task-1 for command-roundtrip",
-        f"responder principal={connection.principal} (transport-supplied)",
+        f"request principal={connection.principal} (transport-supplied)",
         "envelope survived encode/transport/decode unchanged",
     ]
 
 
-def scenario_principal_binding(
-    connection: NatsConnection, responder: AdmissionResponder
-) -> list[str]:
+def scenario_principal_binding(connection: NatsConnection) -> list[str]:
     envelope = _envelope("task-other", "command-foreign")
     reply = connection.request(
         _ADMIT_SUBJECT, encode_command_envelope(envelope), timeout=5.0
@@ -487,24 +495,33 @@ def scenario_principal_binding(
     decision = json.loads(reply.payload.decode("utf-8"))
     assert decision.get("refusal") == "wrong_principal", decision
     return [
-        "task-other belongs to agent-other; transport principal sandbox-local",
+        f"task-other belongs to agent-other; transport principal {_AGENT_USER}",
         "responder refused with wrong_principal despite a well-formed envelope",
         "ownership came from the authenticated user, not the payload",
     ]
 
 
-def scenario_ephemeral_sequenced_frames(username: str, password: str) -> list[str]:
-    connection = NatsConnection(_HOST, _PORT, username, password, "frames")
-    connection.connect()
+def scenario_ephemeral_sequenced_frames(
+    manager_password: str, agent_password: str
+) -> list[str]:
+    publisher = NatsConnection(
+        _HOST, _PORT, _MANAGER_USER, manager_password, "frames-manager"
+    )
+    subscriber = NatsConnection(
+        _HOST, _PORT, _AGENT_USER, agent_password, "frames-agent"
+    )
+    publisher.connect()
+    subscriber.connect()
     try:
-        subject = f"sandbox.task.task-1.{secrets.token_urlsafe(8)}.frames"
-        sid = connection.subscribe(subject, pending=16)
+        subject = f"sandbox.agent.{_AGENT_USER}.task.task-1.command-frames.out"
+        sid = subscriber.subscribe(subject, pending=16)
+        subscriber.flush()
         sequencer = FrameSequencer("command-frames")
         sizes = (1024, 8192, MAX_FRAME_BYTES - 64)
         for sequence, size in enumerate(sizes):
             frame = DataFrame("command-frames", DataChannel.STDOUT, sequence, b"a" * size)
-            connection.publish(subject, encode_frame(frame))
-        connection.publish(
+            publisher.publish(subject, encode_frame(frame))
+        publisher.publish(
             subject,
             encode_frame(
                 TerminalFrame(
@@ -512,19 +529,19 @@ def scenario_ephemeral_sequenced_frames(username: str, password: str) -> list[st
                 )
             ),
         )
-        connection.flush()
+        publisher.flush()
 
         received = 0
         terminal: TerminalFrame | None = None
         for _ in range(len(sizes) + 1):
-            message = connection.next_msg(sid, 5.0)
-            frame = decode_frame(message.payload)
-            if isinstance(frame, DataFrame):
-                sequencer.observe(frame)
+            message = subscriber.next_msg(sid, 5.0)
+            decoded = decode_frame(message.payload)
+            if isinstance(decoded, DataFrame):
+                sequencer.observe(decoded)
                 received += 1
-            elif isinstance(frame, TerminalFrame):
-                terminal = frame
-        connection.unsubscribe(sid)
+            elif isinstance(decoded, TerminalFrame):
+                terminal = decoded
+        subscriber.unsubscribe(sid)
 
         assert terminal is not None, "terminal frame missing"
         assert received == len(sizes)
@@ -535,24 +552,34 @@ def scenario_ephemeral_sequenced_frames(username: str, password: str) -> list[st
             "subject discarded with the subscription after the terminal frame",
         ]
     finally:
-        connection.close()
+        subscriber.close()
+        publisher.close()
 
 
-def scenario_bounded_pending(username: str, password: str) -> list[str]:
-    connection = NatsConnection(_HOST, _PORT, username, password, "slow")
-    connection.connect()
+def scenario_bounded_pending(
+    manager_password: str, agent_password: str
+) -> list[str]:
+    publisher = NatsConnection(
+        _HOST, _PORT, _MANAGER_USER, manager_password, "slow-manager"
+    )
+    subscriber = NatsConnection(
+        _HOST, _PORT, _AGENT_USER, agent_password, "slow-agent"
+    )
+    publisher.connect()
+    subscriber.connect()
     try:
-        subject = f"sandbox.spike.slow.{secrets.token_urlsafe(6)}"
-        sid = connection.subscribe(subject, pending=4)
+        subject = f"sandbox.agent.{_AGENT_USER}.task.task-1.command-slow.out"
+        sid = subscriber.subscribe(subject, pending=4)
+        subscriber.flush()
         total = 16
         for sequence in range(total):
             frame = DataFrame("command-slow", DataChannel.STDOUT, sequence, b"a" * 64)
-            connection.publish(subject, encode_frame(frame))
-        connection.flush()
+            publisher.publish(subject, encode_frame(frame))
+        publisher.flush()
         time.sleep(0.3)
 
-        queued = connection.pending_count(sid)
-        dropped = connection.dropped_count(sid)
+        queued = subscriber.pending_count(sid)
+        dropped = subscriber.dropped_count(sid)
         assert queued <= 4, f"pending grew to {queued}"
         assert queued + dropped == total, f"queued {queued} + dropped {dropped}"
         return [
@@ -561,17 +588,25 @@ def scenario_bounded_pending(username: str, password: str) -> list[str]:
             "overflow drops rather than accumulating without limit",
         ]
     finally:
-        connection.close()
+        subscriber.close()
+        publisher.close()
 
 
-def scenario_stream_loss_is_unknown(username: str, password: str) -> list[str]:
-    subscriber = NatsConnection(_HOST, _PORT, username, password, "loss-sub")
+def scenario_stream_loss_is_unknown(
+    manager_password: str, agent_password: str
+) -> list[str]:
+    subscriber = NatsConnection(
+        _HOST, _PORT, _AGENT_USER, agent_password, "loss-agent"
+    )
     subscriber.connect()
-    publisher = NatsConnection(_HOST, _PORT, username, password, "loss-pub")
+    publisher = NatsConnection(
+        _HOST, _PORT, _MANAGER_USER, manager_password, "loss-manager"
+    )
     publisher.connect()
     try:
-        subject = f"sandbox.task.task-1.{secrets.token_urlsafe(8)}.frames"
+        subject = f"sandbox.agent.{_AGENT_USER}.task.task-1.command-loss.out"
         sid = subscriber.subscribe(subject, pending=16)
+        subscriber.flush()
         sequencer = FrameSequencer("command-loss")
         for sequence in range(2):
             frame = DataFrame("command-loss", DataChannel.STDOUT, sequence, b"a" * 128)
@@ -584,9 +619,9 @@ def scenario_stream_loss_is_unknown(username: str, password: str) -> list[str]:
         try:
             while True:
                 message = subscriber.next_msg(sid, 1.0)
-                frame = decode_frame(message.payload)
-                if isinstance(frame, DataFrame):
-                    sequencer.observe(frame)
+                decoded = decode_frame(message.payload)
+                if isinstance(decoded, DataFrame):
+                    sequencer.observe(decoded)
                     received += 1
         except SpikeTimeout:
             pass
@@ -603,20 +638,29 @@ def scenario_stream_loss_is_unknown(username: str, password: str) -> list[str]:
             publisher.close()
 
 
-def scenario_reconnect_does_not_replay(username: str, password: str) -> list[str]:
-    subject = f"sandbox.task.task-1.{secrets.token_urlsafe(8)}.frames"
-    publisher = NatsConnection(_HOST, _PORT, username, password, "reconnect-pub")
+def scenario_reconnect_does_not_replay(
+    manager_password: str, agent_password: str
+) -> list[str]:
+    subject = f"sandbox.agent.{_AGENT_USER}.task.task-1.command-reconnect.out"
+    publisher = NatsConnection(
+        _HOST, _PORT, _MANAGER_USER, manager_password, "reconnect-manager"
+    )
     publisher.connect()
 
-    first = NatsConnection(_HOST, _PORT, username, password, "reconnect-sub-1")
+    first = NatsConnection(
+        _HOST, _PORT, _AGENT_USER, agent_password, "reconnect-agent-1"
+    )
     first.connect()
     sid = first.subscribe(subject, pending=16)
+    first.flush()
     sequencer = FrameSequencer("command-reconnect")
     frame_zero = DataFrame("command-reconnect", DataChannel.STDOUT, 0, b"a" * 32)
     publisher.publish(subject, encode_frame(frame_zero))
     publisher.flush()
     message = first.next_msg(sid, 5.0)
-    sequencer.observe(decode_frame(message.payload))
+    decoded = decode_frame(message.payload)
+    assert isinstance(decoded, DataFrame)
+    sequencer.observe(decoded)
     first.close()  # subscriber vanishes mid-command
     time.sleep(0.3)  # let the server settle the disconnect first
 
@@ -626,7 +670,9 @@ def scenario_reconnect_does_not_replay(username: str, password: str) -> list[str
     publisher.flush()
     time.sleep(0.3)
 
-    second = NatsConnection(_HOST, _PORT, username, password, "reconnect-sub-2")
+    second = NatsConnection(
+        _HOST, _PORT, _AGENT_USER, agent_password, "reconnect-agent-2"
+    )
     second.connect()
     try:
         sid_two = second.subscribe(subject, pending=16)
@@ -667,7 +713,7 @@ def _load_credentials() -> tuple[str, str]:
             key, _, value = line.partition("=")
             values[key.strip()] = value.strip()
     try:
-        return values["NATS_USERNAME"], values["NATS_PASSWORD"]
+        return values["NATS_MANAGER_PASSWORD"], values["NATS_AGENT_PASSWORD"]
     except KeyError as error:
         raise SpikeNatsError(
             f"config/local.env is missing {error}; start the local environment first"
@@ -675,23 +721,63 @@ def _load_credentials() -> tuple[str, str]:
 
 
 def main() -> int:
-    username, password = _load_credentials()
+    manager_password, agent_password = _load_credentials()
 
-    shared = NatsConnection(_HOST, _PORT, username, password, "admission-client")
-    shared.connect()
-    responder = AdmissionResponder(shared)
+    manager = NatsConnection(
+        _HOST, _PORT, _MANAGER_USER, manager_password, "admission-manager"
+    )
+    agent = NatsConnection(
+        _HOST, _PORT, _AGENT_USER, agent_password, "admission-agent"
+    )
+    manager.connect()
+    agent.connect()
+    responder = AdmissionResponder(manager, _AGENT_USER)
     responder.start()
+    if not responder.ready.wait(_CONNECT_TIMEOUT):
+        raise SpikeTimeout("admission responder did not become ready")
 
-    scenarios: list[tuple[str, object]] = [
-        ("authenticated_connect", lambda: scenario_authenticated_connect(username, password)),
-        ("rejects_wrong_credentials", lambda: scenario_rejects_wrong_credentials(username)),
-        ("transport_cap_fits_frames", lambda: scenario_transport_cap_fits_frames(username, password)),
-        ("admission_round_trip", lambda: scenario_admission_round_trip(shared, responder)),
-        ("principal_binding_refuses_foreign_task", lambda: scenario_principal_binding(shared, responder)),
-        ("task_scoped_ephemeral_sequenced_frames", lambda: scenario_ephemeral_sequenced_frames(username, password)),
-        ("bounded_pending_slow_consumer", lambda: scenario_bounded_pending(username, password)),
-        ("stream_loss_maps_to_unknown", lambda: scenario_stream_loss_is_unknown(username, password)),
-        ("reconnect_does_not_replay", lambda: scenario_reconnect_does_not_replay(username, password)),
+    scenarios: list[tuple[str, Callable[[], list[str]]]] = [
+        (
+            "authenticated_connect",
+            lambda: scenario_authenticated_connect(
+                _AGENT_USER, agent_password
+            ),
+        ),
+        (
+            "rejects_wrong_credentials",
+            lambda: scenario_rejects_wrong_credentials(_AGENT_USER),
+        ),
+        (
+            "transport_cap_fits_frames",
+            lambda: scenario_transport_cap_fits_frames(agent_password),
+        ),
+        ("admission_round_trip", lambda: scenario_admission_round_trip(agent)),
+        (
+            "principal_binding_refuses_foreign_task",
+            lambda: scenario_principal_binding(agent),
+        ),
+        (
+            "task_scoped_ephemeral_sequenced_frames",
+            lambda: scenario_ephemeral_sequenced_frames(
+                manager_password, agent_password
+            ),
+        ),
+        (
+            "bounded_pending_slow_consumer",
+            lambda: scenario_bounded_pending(manager_password, agent_password),
+        ),
+        (
+            "stream_loss_maps_to_unknown",
+            lambda: scenario_stream_loss_is_unknown(
+                manager_password, agent_password
+            ),
+        ),
+        (
+            "reconnect_does_not_replay",
+            lambda: scenario_reconnect_does_not_replay(
+                manager_password, agent_password
+            ),
+        ),
     ]
 
     results: list[ScenarioResult] = []
@@ -711,7 +797,8 @@ def main() -> int:
             print(f"    failure: {result.failure}")
 
     responder.stop()
-    shared.close()
+    agent.close()
+    manager.close()
 
     passed = sum(1 for result in results if result.passed)
     print(f"\n{passed}/{len(results)} scenarios passed")

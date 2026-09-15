@@ -10,8 +10,42 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.11,<3",
+    "ruff>=0.9,<1",
+]
+
 [project.scripts]
 sandbox-manager = "sandbox_manager.__main__:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["sandbox_manager*"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["sandbox_manager", "tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "ASYNC",
+    "B",
+    "BLE",
+    "C4",
+    "DTZ",
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "I",
+    "RUF",
+    "SIM",
+    "UP",
+]
+ignore = ["ASYNC109", "ASYNC240"]

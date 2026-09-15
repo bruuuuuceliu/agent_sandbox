@@ -1,10 +1,9 @@
-"""Stage 4b spike: the production NATS command API on the real local server.
+"""Exercise the production NATS command API on the real local server.
 
 Exercises the shipped components — ``AsyncNatsConnection``,
 ``NatsCommandServer``, ``NatsCommandClient``, and the ``CommandAdmissionGate``
-over ``InMemoryCommandRepository`` — against the local Core NATS container
-(``examples/local/compose.yaml``, nats:2.11 with single-user auth) instead of
-the in-process test fake:
+over ``InMemoryCommandRepository`` against the local Core NATS container with
+principal-scoped ACLs instead of the in-process test fake:
 
 1. Basic-auth CONNECT binds the transport principal the server recovers from
    the admission subject; wrong credentials are refused by the server.
@@ -20,7 +19,7 @@ the in-process test fake:
 
 Run with the local container up:
 
-    PYTHONPATH=src python3 examples/spikes/nats_command_api_spike.py
+    python3 -m examples.spikes.nats_command_api_spike
 
 Credentials come from ``config/local.env`` (git-ignored, local only). Evidence
 lines are payload-free: identifiers, sizes, counts, and outcomes only.
@@ -65,6 +64,10 @@ from sandbox_manager.relay_protocol import (
 _HOST = "127.0.0.1"
 
 _PORT = 15181
+
+_MANAGER_PRINCIPAL = "sandbox-manager"
+
+_AGENT_PRINCIPAL = "sandbox-agent-local"
 
 _TASK_ID = "task-spike-1"
 
@@ -116,7 +119,7 @@ class ScriptedRelay:
                 self.input_bytes += len(payload)
         if output_sink is not None:
             for channel, chunk in self._outputs:
-                output_sink(channel, chunk)
+                await output_sink(channel, chunk)
         if self._hold is not None:
             await self._hold.wait()
         return CommandResult(command.command_id, CommandOutcome.SUCCESS)
@@ -126,7 +129,11 @@ class RelayHarness:
     """One manager-side command server and one agent, both real connections."""
 
     def __init__(
-        self, username: str, password: str, relay: ScriptedRelay, owner: str
+        self,
+        manager_password: str,
+        agent_password: str,
+        relay: ScriptedRelay,
+        owner: str,
     ) -> None:
         self.relay = relay
         self.fence = AdmissionFence()
@@ -142,7 +149,11 @@ class RelayHarness:
             }
         )
         self.manager = AsyncNatsConnection(
-            _HOST, _PORT, username, password, "spike-manager"
+            _HOST,
+            _PORT,
+            _MANAGER_PRINCIPAL,
+            manager_password,
+            "spike-manager",
         )
         self.command_server = NatsCommandServer(
             self.manager,
@@ -155,7 +166,7 @@ class RelayHarness:
             ),
         )
         self.agent = AsyncNatsConnection(
-            _HOST, _PORT, username, password, "spike-agent"
+            _HOST, _PORT, _AGENT_PRINCIPAL, agent_password, "spike-agent"
         )
         self.client = NatsCommandClient(self.agent)
 
@@ -201,8 +212,10 @@ class SpikeNatsError(RuntimeError):
     """Raised when the spike violates its own expectations."""
 
 
-async def scenario_authenticated_principal(username: str, password: str) -> list[str]:
-    connection = AsyncNatsConnection(_HOST, _PORT, username, password, "spike-auth")
+async def scenario_authenticated_principal(agent_password: str) -> list[str]:
+    connection = AsyncNatsConnection(
+        _HOST, _PORT, _AGENT_PRINCIPAL, agent_password, "spike-auth"
+    )
     await connection.connect()
     try:
         await connection.flush()
@@ -214,9 +227,9 @@ async def scenario_authenticated_principal(username: str, password: str) -> list
         await connection.close()
 
 
-async def scenario_rejects_wrong_credentials(username: str) -> list[str]:
+async def scenario_rejects_wrong_credentials() -> list[str]:
     connection = AsyncNatsConnection(
-        _HOST, _PORT, username, "not-the-password", "spike-auth-bad"
+        _HOST, _PORT, _AGENT_PRINCIPAL, "not-the-password", "spike-auth-bad"
     )
     try:
         await connection.connect()
@@ -229,14 +242,18 @@ async def scenario_rejects_wrong_credentials(username: str) -> list[str]:
     raise SpikeNatsError("server accepted a wrong password")
 
 
-async def scenario_command_round_trip(username: str, password: str) -> list[str]:
+async def scenario_command_round_trip(
+    manager_password: str, agent_password: str
+) -> list[str]:
     relay = ScriptedRelay(outputs=((1, b"spike-out"), (2, b"spike-err")))
-    harness = RelayHarness(username, password, relay, owner=username)
+    harness = RelayHarness(
+        manager_password, agent_password, relay, owner=_AGENT_PRINCIPAL
+    )
     await harness.start()
     try:
         observed: list[tuple[int, int]] = []
 
-        def record(channel: int, payload: bytes) -> None:
+        async def record(channel: int, payload: bytes) -> None:
             observed.append((channel, len(payload)))
 
         result = await asyncio.wait_for(
@@ -268,9 +285,13 @@ async def scenario_command_round_trip(username: str, password: str) -> list[str]
         await harness.stop()
 
 
-async def scenario_wrong_principal_refusal(username: str, password: str) -> list[str]:
+async def scenario_wrong_principal_refusal(
+    manager_password: str, agent_password: str
+) -> list[str]:
     relay = ScriptedRelay()
-    harness = RelayHarness(username, password, relay, owner="someone-else")
+    harness = RelayHarness(
+        manager_password, agent_password, relay, owner="someone-else"
+    )
     await harness.start()
     try:
         result = await asyncio.wait_for(
@@ -284,7 +305,7 @@ async def scenario_wrong_principal_refusal(username: str, password: str) -> list
         assert relay.calls == 0, relay.calls
         assert outcome is None, outcome
         return [
-            f"transport principal {username!r} does not own the task",
+            f"transport principal {_AGENT_PRINCIPAL!r} does not own the task",
             "refused wrong_principal before any relay side effect",
             "no durable outcome and zero relay calls",
         ]
@@ -293,11 +314,13 @@ async def scenario_wrong_principal_refusal(username: str, password: str) -> list
 
 
 async def scenario_single_in_flight_command(
-    username: str, password: str
+    manager_password: str, agent_password: str
 ) -> list[str]:
     hold = asyncio.Event()
     relay = ScriptedRelay(outputs=(), hold=hold)
-    harness = RelayHarness(username, password, relay, owner=username)
+    harness = RelayHarness(
+        manager_password, agent_password, relay, owner=_AGENT_PRINCIPAL
+    )
     await harness.start()
     try:
         first = asyncio.create_task(
@@ -325,10 +348,14 @@ async def scenario_single_in_flight_command(
         await harness.stop()
 
 
-async def scenario_manager_loss_is_unknown(username: str, password: str) -> list[str]:
+async def scenario_manager_loss_is_unknown(
+    manager_password: str, agent_password: str
+) -> list[str]:
     hold = asyncio.Event()
     relay = ScriptedRelay(outputs=(), hold=hold)
-    harness = RelayHarness(username, password, relay, owner=username)
+    harness = RelayHarness(
+        manager_password, agent_password, relay, owner=_AGENT_PRINCIPAL
+    )
     await harness.start()
     try:
         executing = asyncio.create_task(
@@ -365,7 +392,7 @@ async def _load_credentials() -> tuple[str, str]:
             key, _, value = line.partition("=")
             values[key.strip()] = value.strip()
     try:
-        return values["NATS_USERNAME"], values["NATS_PASSWORD"]
+        return values["NATS_MANAGER_PASSWORD"], values["NATS_AGENT_PASSWORD"]
     except KeyError as error:
         raise SpikeNatsError(
             f"config/local.env is missing {error}; start the local environment first"
@@ -373,14 +400,35 @@ async def _load_credentials() -> tuple[str, str]:
 
 
 async def _run() -> int:
-    username, password = await _load_credentials()
+    manager_password, agent_password = await _load_credentials()
     scenarios: list[tuple[str, Callable[[], Awaitable[list[str]]]]] = [
-        ("authenticated_transport_principal", lambda: scenario_authenticated_principal(username, password)),
-        ("rejects_wrong_credentials", lambda: scenario_rejects_wrong_credentials(username)),
-        ("command_round_trip", lambda: scenario_command_round_trip(username, password)),
-        ("wrong_principal_refusal", lambda: scenario_wrong_principal_refusal(username, password)),
-        ("single_in_flight_command", lambda: scenario_single_in_flight_command(username, password)),
-        ("manager_loss_is_unknown", lambda: scenario_manager_loss_is_unknown(username, password)),
+        (
+            "authenticated_transport_principal",
+            lambda: scenario_authenticated_principal(agent_password),
+        ),
+        ("rejects_wrong_credentials", scenario_rejects_wrong_credentials),
+        (
+            "command_round_trip",
+            lambda: scenario_command_round_trip(manager_password, agent_password),
+        ),
+        (
+            "wrong_principal_refusal",
+            lambda: scenario_wrong_principal_refusal(
+                manager_password, agent_password
+            ),
+        ),
+        (
+            "single_in_flight_command",
+            lambda: scenario_single_in_flight_command(
+                manager_password, agent_password
+            ),
+        ),
+        (
+            "manager_loss_is_unknown",
+            lambda: scenario_manager_loss_is_unknown(
+                manager_password, agent_password
+            ),
+        ),
     ]
 
     passed = 0

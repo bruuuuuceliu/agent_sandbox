@@ -186,7 +186,7 @@ class InMemoryStateStore:
     ) -> TerminatingRecord:
         if self.terminating.get(task.task_id) != task:
             raise RuntimeError("terminating record is stale")
-        updated = replace(task, completed_steps=task.completed_steps + (step,))
+        updated = replace(task, completed_steps=(*task.completed_steps, step))
         self.terminating[updated.task_id] = updated
         return updated
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -29,7 +29,12 @@ from sandbox_manager.commands import (
     TaskAdmissionState,
 )
 from sandbox_manager.intake import QueuedTask, StoreResult
-from sandbox_manager.nats_client import AsyncNatsConnection, parse_headers
+from sandbox_manager.nats_client import (
+    AsyncNatsConnection,
+    NatsMessage,
+    NatsTransportError,
+    parse_headers,
+)
 from sandbox_manager.nats_lifecycle import (
     COMMAND_EVENT_SCHEMA_VERSION,
     COMMAND_EVENT_SUBJECT,
@@ -415,8 +420,15 @@ class FakeJetStreamServer(FakeNatsServer):
         consumer = stream.consumers.get(durable)
         if consumer is None:
             raise _ApiError(404, "consumer not found", 10114)
+        pending = sum(
+            1
+            for message in stream.messages
+            if message.sequence not in consumer.acked_sequences
+            and _js_subject_matches(consumer.filter_subject, message.subject)
+        )
         return {
             "type": "io.nats.jetstream.api.v1.consumer_info_response",
+            "num_pending": pending,
             "config": {
                 "name": consumer.durable,
                 "filter_subject": consumer.filter_subject,
@@ -604,6 +616,74 @@ class RecordingObserver:
         self.events.append(("deferred", reason))
 
 
+class AckFaultConnection(AsyncNatsConnection):
+    def __init__(self, failures: Mapping[bytes, int]) -> None:
+        super().__init__("127.0.0.1", 4222, _MANAGER_USER, "unused", "ack-fault")
+        self.failures = dict(failures)
+        self.published: list[tuple[str, bytes]] = []
+
+    async def publish(
+        self,
+        subject: str,
+        payload: bytes,
+        reply: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self.published.append((subject, payload))
+        remaining = self.failures.get(payload, 0)
+        if remaining > 0:
+            self.failures[payload] = remaining - 1
+            raise NatsTransportError("injected acknowledgment failure")
+
+
+class ScriptedIntakeJetStream(JetStream):
+    def __init__(
+        self, connection: AsyncNatsConnection, deliveries: list[NatsMessage]
+    ) -> None:
+        super().__init__(connection)
+        self.deliveries = deliveries
+        self.empty = asyncio.Event()
+
+    async def ensure_stream(
+        self, name: str, subjects: tuple[str, ...]
+    ) -> dict[str, object]:
+        return {}
+
+    async def ensure_consumer(
+        self,
+        stream: str,
+        durable: str,
+        filter_subject: str,
+        *,
+        ack_wait_seconds: float,
+        max_deliver: int,
+        max_ack_pending: int = 1,
+    ) -> dict[str, object]:
+        return {}
+
+    async def fetch(
+        self, stream: str, durable: str, *, wait_seconds: float
+    ) -> NatsMessage | None:
+        if self.deliveries:
+            return self.deliveries.pop(0)
+        await self.empty.wait()
+        return None
+
+
+class TransientEmptyJetStream(JetStream):
+    def __init__(self, connection: AsyncNatsConnection) -> None:
+        super().__init__(connection)
+        self.fetch_calls = 0
+
+    async def fetch(
+        self, stream: str, durable: str, *, wait_seconds: float
+    ) -> NatsMessage | None:
+        self.fetch_calls += 1
+        if self.fetch_calls == 1:
+            return None
+        return await super().fetch(stream, durable, wait_seconds=wait_seconds)
+
+
 class LifecycleEnvironment:
     """One fake JetStream server and one authenticated manager connection."""
 
@@ -663,6 +743,8 @@ class SubjectLayoutTests(unittest.TestCase):
             principal_from_ready_subject("sandbox.manager.agent-1.task.t.ready"),
             "agent-1",
         )
+        with self.assertRaises(NatsLifecycleError):
+            principal_from_ready_subject("sandbox.manager.agent-1.task.bad/value.ready")
 
     def test_foreign_subjects_are_rejected(self) -> None:
         for subject in (
@@ -717,12 +799,27 @@ class ReadyResponseTests(unittest.TestCase):
         cases: list[tuple[str, object]] = [
             ("not json", b"\x00"),
             ("array", b"[]"),
+            ("boolean version", _mutate(valid, schema_version=True)),
             ("unknown version", _mutate(valid, schema_version=99)),
             ("missing field", _drop(valid, "task_id")),
             ("extra field", _mutate(valid, extra="x")),
             ("empty text", _mutate(valid, task_id="")),
+            ("unsafe identifier", _mutate(valid, task_id="task.bad")),
             ("non-text", _mutate(valid, sandbox_type=7)),
             ("non-integer version", _mutate(valid, relay_protocol_version="1")),
+            ("boolean relay version", _mutate(valid, relay_protocol_version=True)),
+            ("unknown relay version", _mutate(valid, relay_protocol_version=99)),
+            (
+                "owner route mismatch",
+                _mutate(valid, relay_route=admission_subject("different-agent")),
+            ),
+            (
+                "duplicate field",
+                encode_ready_response(ready_task()).replace(
+                    b'"schema_version":1',
+                    b'"schema_version":1,"schema_version":1',
+                ),
+            ),
         ]
         for name, payload in cases:
             with self.subTest(case=name):
@@ -959,6 +1056,22 @@ class SpawnIntakeTests(unittest.IsolatedAsyncioTestCase):
             await intake.stop()
             await environment.stop()
 
+    async def test_duplicate_start_is_rejected_without_leaking_a_worker(self) -> None:
+        connection = AckFaultConnection({})
+        jetstream = ScriptedIntakeJetStream(connection, [])
+        intake = JetStreamSpawnIntake(jetstream, IntakeRepository())
+        await intake.start()
+        first_worker = intake._task
+        try:
+            with self.assertRaisesRegex(NatsLifecycleError, "already started"):
+                await intake.start()
+            self.assertIs(intake._task, first_worker)
+        finally:
+            await intake.stop()
+
+        assert first_worker is not None
+        self.assertTrue(first_worker.done())
+
     async def test_principal_mismatch_is_terminated_not_redelivered(self) -> None:
         environment = LifecycleEnvironment()
         await environment.start()
@@ -1074,6 +1187,78 @@ class SpawnIntakeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await intake.stop()
             await environment.stop()
+
+    async def test_failed_term_is_deferred_and_worker_continues(self) -> None:
+        connection = AckFaultConnection({b"+TERM": 1})
+        subject = spawn_subject(_AGENT_USER)
+        jetstream = ScriptedIntakeJetStream(
+            connection,
+            [
+                NatsMessage(subject, "$JS.ACK.S.C.1", b"not-json"),
+                NatsMessage(subject, "$JS.ACK.S.C.2", b"not-json"),
+                NatsMessage(
+                    subject,
+                    "$JS.ACK.S.C.3",
+                    spawn_payload(task_id="task-2", request_id="request-2"),
+                ),
+            ],
+        )
+        repository = IntakeRepository()
+        observer = RecordingObserver()
+        intake = JetStreamSpawnIntake(
+            jetstream,
+            repository,
+            redelivery_delay_seconds=0.01,
+            observer=observer,
+        )
+        try:
+            await intake.start()
+            await _until(lambda: "task-2" in repository.tasks)
+
+            self.assertEqual(
+                observer.events,
+                [
+                    ("deferred", "invalid_request:term_lost"),
+                    ("poisoned", "invalid_request"),
+                ],
+            )
+        finally:
+            await intake.stop()
+
+    async def test_failed_ack_is_redelivered_and_worker_continues(self) -> None:
+        connection = AckFaultConnection({b"+ACK": 1})
+        subject = spawn_subject(_AGENT_USER)
+        first = spawn_payload()
+        jetstream = ScriptedIntakeJetStream(
+            connection,
+            [
+                NatsMessage(subject, "$JS.ACK.S.C.1", first),
+                NatsMessage(subject, "$JS.ACK.S.C.2", first),
+                NatsMessage(
+                    subject,
+                    "$JS.ACK.S.C.3",
+                    spawn_payload(task_id="task-2", request_id="request-2"),
+                ),
+            ],
+        )
+        repository = IntakeRepository()
+        observer = RecordingObserver()
+        intake = JetStreamSpawnIntake(
+            jetstream,
+            repository,
+            redelivery_delay_seconds=0.01,
+            observer=observer,
+        )
+        try:
+            await intake.start()
+            await _until(lambda: "task-2" in repository.tasks)
+
+            self.assertEqual(repository.calls, 3)
+            self.assertEqual(
+                observer.events, [("deferred", "NatsTransportError")]
+            )
+        finally:
+            await intake.stop()
 
 
 class ReadyPublisherTests(unittest.IsolatedAsyncioTestCase):
@@ -1203,12 +1388,15 @@ class CommandEventCodecTests(unittest.TestCase):
         for payload in (
             b"not-json",
             b"[]",
+            mutate(schema_version=True),
             mutate(schema_version=2),
             mutate(kind="demolished"),
             mutate(kind="admitted"),
             drop("task_id"),
             mutate(task_id=""),
+            mutate(task_id="task.bad"),
             mutate(command_id="command-1"),
+            b'{"schema_version":1,"schema_version":1,"kind":"termination_begun","task_id":"task-1"}',
         ):
             with self.subTest(payload=payload), self.assertRaises(
                 NatsLifecycleError
@@ -1415,6 +1603,33 @@ class CommandEventJournalTests(unittest.IsolatedAsyncioTestCase):
             replayed = InMemoryCommandRepository()
             self.assertEqual(await journal.replay_into(replayed), 0)
             self.assertIsNone(await replayed.admission_state("task-1"))
+        finally:
+            await environment.stop()
+
+    async def test_replay_continues_after_transient_empty_pull(self) -> None:
+        environment = LifecycleEnvironment()
+        await environment.start()
+        try:
+            assert environment.jetstream is not None
+            jetstream = TransientEmptyJetStream(environment.jetstream.connection)
+            journal = self._journal(jetstream)
+            await journal.start()
+            await journal.append(
+                CommandEvent(
+                    kind=CommandEventKind.SEED_READY,
+                    task_id="task-after-empty",
+                    agent_session_id=_AGENT_USER,
+                    profile="default",
+                    fence_generation="fence-a",
+                )
+            )
+
+            replayed = InMemoryCommandRepository()
+            self.assertEqual(await journal.replay_into(replayed), 1)
+            self.assertIsNotNone(
+                await replayed.admission_state("task-after-empty")
+            )
+            self.assertGreaterEqual(jetstream.fetch_calls, 2)
         finally:
             await environment.stop()
 

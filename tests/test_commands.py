@@ -74,6 +74,11 @@ class RecordingAudit:
         self.entries.append(entry)
 
 
+class FailingAudit:
+    async def record(self, entry: CommandAuditEntry) -> None:
+        raise RuntimeError("audit transport unavailable")
+
+
 class RecordingRelay:
     def __init__(self) -> None:
         self.calls: list[tuple[AdmittedCommand, CommandEnvelope]] = []
@@ -115,6 +120,19 @@ class FailingFinishRepository(InMemoryCommandRepository):
         completed_at: datetime,
     ) -> None:
         raise RuntimeError("durable store unavailable")
+
+
+class SlowReturningAdmitRepository(InMemoryCommandRepository):
+    def __init__(self, states: dict[str, TaskAdmissionState]) -> None:
+        super().__init__(states)
+        self.committed = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def admit(self, request: AdmissionRequest) -> AdmissionDecision:
+        decision = await super().admit(request)
+        self.committed.set()
+        await self.release.wait()
+        return decision
 
 
 def admission_state(
@@ -281,6 +299,23 @@ class CommandAdmissionGateTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CommandInFlightError):
             await gate(repo).admit(_PRINCIPAL, envelope("command-2"))
 
+    async def test_cancellation_after_durable_admission_releases_slot(self) -> None:
+        state = admission_state()
+        repo = SlowReturningAdmitRepository({state.task_id: state})
+        admitting = asyncio.create_task(gate(repo).admit(_PRINCIPAL, envelope()))
+        await repo.committed.wait()
+
+        admitting.cancel()
+        await asyncio.sleep(0)
+        repo.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await admitting
+
+        current = await repo.admission_state("task-1")
+        assert current is not None
+        self.assertIsNone(current.in_flight_command_id)
+        self.assertIs(await repo.outcome("command-1"), CommandOutcome.UNKNOWN)
+
     async def test_run_records_success_and_releases_slot(self) -> None:
         repo = repository(admission_state())
         audit = RecordingAudit()
@@ -334,12 +369,32 @@ class CommandAdmissionGateTests(unittest.IsolatedAsyncioTestCase):
         repo = repository(admission_state())
         relay = RecordingRelay()
 
-        def sink(channel: int, payload: bytes) -> None:
+        async def sink(channel: int, payload: bytes) -> None:
             return None
 
         await gate(repo, relay=relay).run(_PRINCIPAL, envelope(), None, sink)
 
         self.assertIs(relay.sinks[0], sink)
+
+    async def test_audit_failure_does_not_hide_the_durable_result(self) -> None:
+        repo = repository(admission_state())
+        relay = RecordingRelay()
+        command_gate = CommandAdmissionGate(
+            repository=repo,
+            policy=AllowPolicy(),
+            audit=FailingAudit(),
+            relay=relay,
+            fence=AdmissionFence(_FENCE),
+            clock=FixedClock(),
+        )
+
+        result = await command_gate.run(_PRINCIPAL, envelope(), None)
+
+        self.assertIs(result.outcome, CommandOutcome.SUCCESS)
+        self.assertIs(
+            await repo.outcome("command-1"),
+            CommandOutcome.SUCCESS,
+        )
 
     async def test_admit_persistence_failure_is_wrapped(self) -> None:
         repo = FailingAdmitRepository(
@@ -471,6 +526,32 @@ class AdmissionContractTests(unittest.TestCase):
 
     def test_fence_generations_are_random_per_process(self) -> None:
         self.assertNotEqual(AdmissionFence().generation, AdmissionFence().generation)
+
+    def test_command_identifiers_are_validated_on_direct_construction(self) -> None:
+        for identifier in ("bad.id", "caf\N{LATIN SMALL LETTER E WITH ACUTE}", "x" * 65):
+            with self.subTest(identifier=identifier):
+                with self.assertRaises(ValueError):
+                    AdmissionFence(identifier)
+                with self.assertRaises(ValueError):
+                    AdmissionRequest(
+                        task_id=identifier,
+                        command_id="command-1",
+                        authenticated_principal=_PRINCIPAL,
+                        fence_generation=_FENCE,
+                        admitted_at=_NOW,
+                    )
+
+    def test_admitted_command_requires_a_boolean_activation_flag(self) -> None:
+        with self.assertRaises(TypeError):
+            AdmittedCommand(
+                task_id="task-1",
+                command_id="command-1",
+                agent_session_id=_PRINCIPAL,
+                profile="default",
+                fence_generation=_FENCE,
+                activated=1,  # type: ignore[arg-type]
+                admitted_at=_NOW,
+            )
 
     def test_audit_entry_cannot_carry_payload_fields(self) -> None:
         names = {entry.name for entry in dataclasses.fields(CommandAuditEntry)}

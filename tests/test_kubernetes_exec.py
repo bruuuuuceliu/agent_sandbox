@@ -5,6 +5,8 @@ import base64
 import hashlib
 import json
 import os
+import socket
+import ssl
 import threading
 import time
 import unittest
@@ -18,9 +20,14 @@ from unittest.mock import patch
 
 from sandbox_manager import kubernetes_exec
 from sandbox_manager.commands import AdmittedCommand
+from sandbox_manager.kubernetes import (
+    TASK_ANNOTATION,
+    SandboxWorkload,
+    build_sandbox_resources,
+)
 from sandbox_manager.kubernetes_exec import (
     RELAY_HELPER_PATH,
-    TASK_ANNOTATION,
+    ExecStream,
     KubernetesApi,
     KubernetesApiConfig,
     KubernetesCommandRelay,
@@ -36,11 +43,15 @@ from sandbox_manager.kubernetes_exec import (
 )
 from sandbox_manager.relay_protocol import (
     RELAY_SCHEMA_VERSION,
+    CancelSignal,
     CommandEnvelope,
     CommandOutcome,
     DataChannel,
     DataFrame,
+    RelayFrame,
     RelayOperation,
+    RelayProtocolError,
+    TerminalFrame,
     encode_frame,
 )
 
@@ -115,6 +126,9 @@ def admitted_command() -> AdmittedCommand:
 
 def relay_envelope(
     operation: RelayOperation = RelayOperation.EXEC,
+    *,
+    declared_input_bytes: int = 64,
+    declared_output_bytes: int = 1024,
 ) -> CommandEnvelope:
     return CommandEnvelope(
         schema_version=RELAY_SCHEMA_VERSION,
@@ -122,8 +136,8 @@ def relay_envelope(
         task_id="task-1",
         operation=operation,
         correlation_id="correlation-1",
-        declared_input_bytes=64,
-        declared_output_bytes=1024,
+        declared_input_bytes=declared_input_bytes,
+        declared_output_bytes=declared_output_bytes,
     )
 
 
@@ -150,6 +164,23 @@ async def upload_stream(
         )
         sequence += 1
         offset += len(piece)
+
+
+async def frame_stream(*frames: RelayFrame) -> AsyncIterator[bytes]:
+    for frame in frames:
+        yield encode_frame(frame)
+
+
+def argv_frame(
+    *,
+    command_id: str = "command-1",
+    channel: DataChannel = DataChannel.STDIN,
+    sequence: int = 0,
+    payload: bytes | None = None,
+) -> DataFrame:
+    if payload is None:
+        payload = json.dumps({"argv": ["ls"]}).encode("utf-8")
+    return DataFrame(command_id, channel, sequence, payload)
 
 
 class _FakeKubeHTTPServer(ThreadingHTTPServer):
@@ -295,13 +326,9 @@ class _FakeKubeHandler(BaseHTTPRequestHandler):
             for channel, payload in server.exec_frames:
                 self._write_channel_frames(server, channel, payload)
             if server.exec_drop:
-                # Abrupt loss: close everything so the peer actually sees EOF
-                # (rfile/wfile hold the descriptor open otherwise).
                 self.wfile.flush()
                 self.close_connection = True
-                self.wfile.close()
-                self.rfile.close()
-                self.connection.close()
+                self.connection.shutdown(socket.SHUT_RDWR)
                 return
             if server.exec_close_code is not None:
                 self._write_ws_frame(
@@ -601,6 +628,33 @@ class ClassifyTerminationTests(unittest.TestCase):
 
 
 class PodVerificationTests(unittest.TestCase):
+    def test_accepts_annotation_from_resource_builder(self) -> None:
+        resources = build_sandbox_resources(
+            SandboxWorkload(
+                namespace=_NAMESPACE,
+                task_id="task-1",
+                image="registry.example/sandbox/python@sha256:" + "a" * 64,
+                command=("python", "-m", "sandbox_agent"),
+                runtime_class_name="runsc",
+                storage_class_name="encrypted-rwo",
+                result_storage="1Gi",
+                results_mount_path="/results",
+            )
+        )
+        pod = resources.pod.copy()
+        metadata = cast(dict[str, object], pod["metadata"]).copy()
+        metadata["uid"] = "uid-1"
+        pod["metadata"] = metadata
+        pod["status"] = {"phase": "Running"}
+
+        built = kubernetes_exec._parse_pod_snapshot(
+            _NAMESPACE, cast(str, metadata["name"]), pod
+        )
+
+        PodVerification(
+            expected_uid="uid-1", task_id="task-1", namespace=_NAMESPACE
+        ).verify(built)
+
     def test_accepts_matching_snapshot(self) -> None:
         verification().verify(snapshot())
 
@@ -694,6 +748,82 @@ class ServiceAccountConfigTests(unittest.TestCase):
         with self.assertRaises(KubernetesExecError):
             KubernetesApiConfig(host="h", port=1, bearer_token="")
 
+    def test_requires_a_positive_finite_request_timeout(self) -> None:
+        for timeout in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(timeout=timeout), self.assertRaises(
+                KubernetesExecError
+            ):
+                KubernetesApiConfig(
+                    host="h",
+                    port=1,
+                    bearer_token="token",
+                    request_timeout_seconds=timeout,
+                )
+
+    def test_request_timeout_is_passed_to_http_connections(self) -> None:
+        insecure = KubernetesApiConfig(
+            host="kubernetes.internal",
+            port=80,
+            bearer_token="token",
+            secure=False,
+            request_timeout_seconds=2.5,
+        )
+        with patch.object(kubernetes_exec, "HTTPConnection") as connection_type:
+            response = connection_type.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = b"{}"
+
+            KubernetesApi(insecure)._get_json("/api/v1/pods")
+
+        self.assertEqual(connection_type.call_args.kwargs["timeout"], 2.5)
+
+        secure = KubernetesApiConfig(
+            host="kubernetes.internal",
+            port=443,
+            bearer_token="token",
+            request_timeout_seconds=3.5,
+        )
+        with patch.object(kubernetes_exec, "HTTPSConnection") as connection_type:
+            response = connection_type.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = b"{}"
+
+            KubernetesApi(secure)._get_json("/api/v1/pods")
+
+        self.assertEqual(connection_type.call_args.kwargs["timeout"], 3.5)
+
+    def test_bearer_token_is_redacted_from_repr(self) -> None:
+        config = KubernetesApiConfig(
+            host="kubernetes.internal",
+            port=443,
+            bearer_token="do-not-expose-this-token",
+        )
+
+        self.assertNotIn("do-not-expose-this-token", repr(config))
+
+    def test_tls_without_service_account_ca_uses_verified_system_roots(self) -> None:
+        config = KubernetesApiConfig(
+            host="kubernetes.internal", port=443, bearer_token="token"
+        )
+
+        context = config.ssl_context()
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_unreadable_ca_fails_instead_of_disabling_verification(self) -> None:
+        config = KubernetesApiConfig(
+            host="kubernetes.internal",
+            port=443,
+            bearer_token="token",
+            ca_cert_path="/path/that/does/not/exist/ca.crt",
+        )
+
+        with self.assertRaises(FileNotFoundError):
+            config.ssl_context()
+
 
 def _write_service_account() -> Path:
     import tempfile
@@ -701,6 +831,362 @@ def _write_service_account() -> Path:
     directory = Path(tempfile.mkdtemp())
     (directory / "token").write_text("token-value\n", encoding="utf-8")
     return directory
+
+
+class _RecordingExecStream:
+    def __init__(self, frames: list[tuple[int, bytes]] | None = None) -> None:
+        self.closed = False
+        self.close_calls = 0
+        self.sent: list[bytes] = []
+        self.frames = [] if frames is None else list(frames)
+        self._closed = asyncio.Event()
+
+    async def send_stdin(self, payload: bytes) -> None:
+        self.sent.append(payload)
+
+    def start_keepalive(self, interval: float, pong_timeout: float) -> None:
+        return
+
+    async def receive(self) -> tuple[int, bytes] | None:
+        if self.frames:
+            return self.frames.pop(0)
+        await self._closed.wait()
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+        self.close_calls += 1
+        self._closed.set()
+
+
+class _ControlledRelayApi:
+    def __init__(
+        self,
+        stream: _RecordingExecStream,
+        *,
+        block_pod_lookup: bool = False,
+        block_exec_setup: bool = False,
+    ) -> None:
+        self.stream = stream
+        self.block_pod_lookup = block_pod_lookup
+        self.block_exec_setup = block_exec_setup
+        self.pod_calls = 0
+        self.exec_calls = 0
+
+    async def pod_snapshot(self, namespace: str, name: str) -> PodSnapshot:
+        self.pod_calls += 1
+        if self.block_pod_lookup:
+            await asyncio.Event().wait()
+        return snapshot(namespace=namespace)
+
+    async def exec_stream(
+        self, namespace: str, name: str, container: str, tty: bool
+    ) -> ExecStream:
+        self.exec_calls += 1
+        if self.block_exec_setup:
+            await asyncio.Event().wait()
+        return cast(ExecStream, self.stream)
+
+
+class _RecordingWriter:
+    def __init__(self) -> None:
+        self.closed = False
+        self.drain_started = asyncio.Event()
+
+    def write(self, data: bytes) -> None:
+        return
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return
+
+
+class KubernetesRelayIntegrityTests(unittest.IsolatedAsyncioTestCase):
+    def relay(
+        self, stream: _RecordingExecStream, **api_options: bool
+    ) -> KubernetesCommandRelay:
+        api = _ControlledRelayApi(stream, **api_options)
+        return KubernetesCommandRelay(api, lambda task_id: PodTarget(
+            namespace=_NAMESPACE,
+            name="pod-1",
+            verification=verification(),
+        ))
+
+    async def test_deadline_includes_pod_lookup_and_exec_setup(self) -> None:
+        for blocked_stage in ("pod", "exec"):
+            with self.subTest(blocked_stage=blocked_stage):
+                stream = _RecordingExecStream()
+                api = _ControlledRelayApi(
+                    stream,
+                    block_pod_lookup=blocked_stage == "pod",
+                    block_exec_setup=blocked_stage == "exec",
+                )
+                relay = KubernetesCommandRelay(
+                    api,
+                    lambda task_id: PodTarget(
+                        namespace=_NAMESPACE,
+                        name="pod-1",
+                        verification=verification(),
+                    ),
+                    stream_deadline_seconds=0.01,
+                    keepalive_interval=0,
+                )
+
+                result = await relay.execute(
+                    admitted_command(), relay_envelope(), None
+                )
+
+                self.assertIs(result.outcome, CommandOutcome.UNKNOWN)
+                self.assertEqual(result.reason_code, "deadline_exceeded")
+                self.assertEqual(api.pod_calls, 1)
+                self.assertEqual(api.exec_calls, blocked_stage == "exec")
+
+    async def test_malformed_argv_closes_opened_stream(self) -> None:
+        stream = _RecordingExecStream()
+
+        with self.assertRaises(RelayProtocolError):
+            await self.relay(stream).execute(
+                admitted_command(),
+                relay_envelope(),
+                frame_stream(argv_frame(payload=b"{not-json")),
+            )
+
+        self.assertTrue(stream.closed)
+
+    async def test_cancellation_while_awaiting_argv_closes_opened_stream(self) -> None:
+        stream = _RecordingExecStream()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def waiting_input() -> AsyncIterator[bytes]:
+            entered.set()
+            await release.wait()
+            yield encode_frame(argv_frame())
+
+        task = asyncio.create_task(
+            self.relay(stream).execute(
+                admitted_command(), relay_envelope(), waiting_input()
+            )
+        )
+        await entered.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(stream.closed)
+
+    async def test_rejects_wrong_command_id_and_non_stdin_argv(self) -> None:
+        cases = (
+            argv_frame(command_id="command-2"),
+            argv_frame(channel=DataChannel.STDOUT),
+        )
+        for frame in cases:
+            with self.subTest(frame=frame):
+                stream = _RecordingExecStream()
+                with self.assertRaises(RelayProtocolError):
+                    await self.relay(stream).execute(
+                        admitted_command(), relay_envelope(), frame_stream(frame)
+                    )
+                self.assertTrue(stream.closed)
+
+    async def test_rejects_stdin_sequence_gaps_and_duplicates(self) -> None:
+        for invalid_sequence in (0, 2):
+            with self.subTest(invalid_sequence=invalid_sequence):
+                stream = _RecordingExecStream()
+                with self.assertRaises(RelayProtocolError):
+                    await self.relay(stream).execute(
+                        admitted_command(),
+                        relay_envelope(),
+                        frame_stream(
+                            argv_frame(),
+                            DataFrame(
+                                "command-1",
+                                DataChannel.STDIN,
+                                invalid_sequence,
+                                b"payload",
+                            ),
+                        ),
+                    )
+                self.assertTrue(stream.closed)
+
+    async def test_rejects_wrong_cancel_command_and_terminal_input(self) -> None:
+        invalid_frames: tuple[RelayFrame, ...] = (
+            CancelSignal(RELAY_SCHEMA_VERSION, "command-2"),
+            TerminalFrame(
+                RELAY_SCHEMA_VERSION, "command-1", CommandOutcome.SUCCESS
+            ),
+        )
+        for invalid_frame in invalid_frames:
+            with self.subTest(frame=invalid_frame):
+                stream = _RecordingExecStream()
+                with self.assertRaises(RelayProtocolError):
+                    await self.relay(stream).execute(
+                        admitted_command(),
+                        relay_envelope(),
+                        frame_stream(argv_frame(), invalid_frame),
+                    )
+                self.assertTrue(stream.closed)
+
+    async def test_declared_input_budget_excludes_argv_and_rejects_overflow(
+        self,
+    ) -> None:
+        stream = _RecordingExecStream()
+
+        with self.assertRaisesRegex(RelayProtocolError, "declared input"):
+            await self.relay(stream).execute(
+                admitted_command(),
+                relay_envelope(declared_input_bytes=2),
+                frame_stream(
+                    argv_frame(payload=b'{"argv":["a very long argument"]}'),
+                    DataFrame("command-1", DataChannel.STDIN, 1, b"abc"),
+                ),
+            )
+
+        self.assertTrue(stream.closed)
+        self.assertEqual(len(stream.sent), 1)
+
+    async def test_declared_output_budget_accepts_the_exact_bound(self) -> None:
+        stream = _RecordingExecStream(
+            [
+                (kubernetes_exec.CHANNEL_STDOUT, b"abc"),
+                (kubernetes_exec.CHANNEL_STDERR, b"de"),
+                (
+                    kubernetes_exec.CHANNEL_ERROR,
+                    b"command terminated with exit code 0",
+                ),
+            ]
+        )
+        observed: list[tuple[int, bytes]] = []
+
+        async def sink(channel: int, payload: bytes) -> None:
+            observed.append((channel, payload))
+
+        result = await self.relay(stream).execute(
+            admitted_command(),
+            relay_envelope(declared_output_bytes=5),
+            frame_stream(argv_frame()),
+            sink,
+        )
+
+        self.assertIs(result.outcome, CommandOutcome.SUCCESS)
+        self.assertEqual(
+            observed,
+            [
+                (kubernetes_exec.CHANNEL_STDOUT, b"abc"),
+                (kubernetes_exec.CHANNEL_STDERR, b"de"),
+            ],
+        )
+
+    async def test_declared_output_overflow_closes_before_sink_delivery(self) -> None:
+        stream = _RecordingExecStream(
+            [
+                (kubernetes_exec.CHANNEL_STDOUT, b"abc"),
+                (kubernetes_exec.CHANNEL_STDERR, b"def"),
+                (
+                    kubernetes_exec.CHANNEL_ERROR,
+                    b"command terminated with exit code 0",
+                ),
+            ]
+        )
+        observed: list[tuple[int, bytes]] = []
+
+        async def sink(channel: int, payload: bytes) -> None:
+            observed.append((channel, payload))
+
+        with self.assertRaisesRegex(RelayProtocolError, "declared output"):
+            await self.relay(stream).execute(
+                admitted_command(),
+                relay_envelope(declared_output_bytes=5),
+                frame_stream(argv_frame()),
+                sink,
+            )
+
+        self.assertTrue(stream.closed)
+        self.assertEqual(observed, [(kubernetes_exec.CHANNEL_STDOUT, b"abc")])
+
+
+class ExecUpgradeCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upgrade_timeout_closes_the_connected_writer(self) -> None:
+        reader = asyncio.StreamReader()
+        writer = _RecordingWriter()
+
+        async def open_connection(
+            *args: object, **kwargs: object
+        ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+            return reader, cast(asyncio.StreamWriter, writer)
+
+        api = KubernetesApi(
+            KubernetesApiConfig(
+                host="kubernetes.internal",
+                port=80,
+                bearer_token="token",
+                secure=False,
+                request_timeout_seconds=0.01,
+            )
+        )
+        with (
+            patch.object(asyncio, "open_connection", open_connection),
+            self.assertRaisesRegex(KubernetesExecError, "timed out"),
+        ):
+            await api.exec_stream(_NAMESPACE, "pod-1", "sandbox", False)
+
+        self.assertTrue(writer.closed)
+
+    async def test_upgrade_cancellation_closes_the_connected_writer(self) -> None:
+        reader = asyncio.StreamReader()
+        writer = _RecordingWriter()
+
+        async def open_connection(
+            *args: object, **kwargs: object
+        ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+            return reader, cast(asyncio.StreamWriter, writer)
+
+        config = KubernetesApiConfig(
+            host="kubernetes.internal",
+            port=80,
+            bearer_token="token",
+            secure=False,
+        )
+        with patch.object(asyncio, "open_connection", open_connection):
+            task = asyncio.create_task(
+                kubernetes_exec._open_exec_stream(config, "/exec")
+            )
+            await writer.drain_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(writer.closed)
+
+
+class WebSocketFrameHeaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_headers_fail_without_waiting_for_payload(self) -> None:
+        oversized = kubernetes_exec._WS_MAX_MESSAGE_BYTES + 1
+        cases = {
+            "masked": b"\x82\x80",
+            "reserved bit": b"\xc2\x00",
+            "reserved opcode": b"\x83\x00",
+            "fragmented control": b"\x09\x00",
+            "extended control": b"\x89\x7e",
+            "oversized data": b"\x82\x7f" + oversized.to_bytes(8, "big"),
+            "invalid 64-bit length": b"\x82\x7f\x80" + b"\x00" * 7,
+            "non-canonical 16-bit": b"\x82\x7e\x00\x7d",
+            "non-canonical 64-bit": b"\x82\x7f" + (65535).to_bytes(8, "big"),
+        }
+
+        for name, header in cases.items():
+            with self.subTest(name=name):
+                reader = asyncio.StreamReader()
+                reader.feed_data(header)
+                with self.assertRaises(KubernetesExecError):
+                    await asyncio.wait_for(
+                        kubernetes_exec._ws_read_frame(reader), timeout=0.1
+                    )
 
 
 class _KubeTestBase(unittest.IsolatedAsyncioTestCase):
@@ -859,7 +1345,7 @@ class KubernetesCommandRelayTests(_KubeTestBase):
         ]
         observed: list[tuple[int, bytes]] = []
 
-        def sink(channel: int, payload: bytes) -> None:
+        async def sink(channel: int, payload: bytes) -> None:
             observed.append((channel, payload))
 
         result = await asyncio.wait_for(
@@ -942,7 +1428,7 @@ class ExecStreamHardeningTests(_KubeTestBase):
         relay = KubernetesCommandRelay(self.api, self.locate)
         observed: list[tuple[int, bytes]] = []
 
-        def sink(channel: int, payload: bytes) -> None:
+        async def sink(channel: int, payload: bytes) -> None:
             observed.append((channel, payload))
 
         result = await asyncio.wait_for(

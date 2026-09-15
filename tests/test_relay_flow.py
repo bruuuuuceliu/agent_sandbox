@@ -300,7 +300,7 @@ class RelayFlowTests(unittest.IsolatedAsyncioTestCase):
         try:
             observed: list[tuple[int, bytes]] = []
 
-            def record(channel: int, payload: bytes) -> None:
+            async def record(channel: int, payload: bytes) -> None:
                 observed.append((channel, payload))
 
             result = await asyncio.wait_for(
@@ -392,7 +392,7 @@ class RelayFlowTests(unittest.IsolatedAsyncioTestCase):
             ]
             observed: list[bytes] = []
 
-            def record(channel: int, chunk: bytes) -> None:
+            async def record(channel: int, chunk: bytes) -> None:
                 if channel == 1:
                     observed.append(chunk)
 
@@ -697,7 +697,7 @@ class RelayFlowTests(unittest.IsolatedAsyncioTestCase):
         try:
             observed: list[tuple[int, bytes]] = []
 
-            def record(channel: int, payload: bytes) -> None:
+            async def record(channel: int, payload: bytes) -> None:
                 observed.append((channel, payload))
 
             result = await asyncio.wait_for(

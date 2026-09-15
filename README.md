@@ -12,12 +12,19 @@ resources with no inbound network surface: every agent command transits the
 authenticated manager relay over Core NATS. Async health supervision,
 deadlines, terminal cleanup, and restart reconciliation preserve durable
 ordering and retained result storage. Kubernetes API, durable-state, and
-transport adapters remain explicit ports so environment policy is supplied
-at deployment.
+transport adapters remain explicit ports.
+
+The installed CLI is currently an operational shell: it validates
+configuration and serves liveness, but it does not yet compose those ports
+into a running manager. Its readiness endpoint therefore remains unavailable.
+The included deployment manifests are integration templates, not a production
+release, until concrete persistence, Kubernetes, health-transport, and runtime
+supervision adapters are wired at startup.
 
 ## Local Start
 
-Start the manager and its project-scoped NATS JetStream dependency:
+Start the manager operational shell and its project-scoped NATS JetStream
+dependency:
 
 ~~~bash
 ./examples/local/start_all.sh --init
@@ -46,7 +53,7 @@ runtime files:
 
 | Path | Purpose |
 |---|---|
-| `src/sandbox_manager/` | Service, configuration, and HTTP endpoint package |
+| `sandbox_manager/` | Service, configuration, and HTTP endpoint package |
 | `tests/` | Standard-library unit and HTTP integration tests |
 | `pyproject.toml` | Python package metadata and CLI entry point |
 | `config/` | Local, development, and production configuration pairs |
@@ -62,27 +69,29 @@ tracked `*.config` files.
 
 ## Deployment
 
-Manager deployment lives in `deploy/kubernetes/`: the `sandbox-manager`
+The manager deployment template lives in `deploy/kubernetes/`: the `sandbox-manager`
 namespace, a `sandbox-manager` ServiceAccount, a Role/RoleBinding scoped to
 the narrow resource and subresource set the manager needs (`pods`, `pods/exec`,
 `persistentvolumeclaims`, `networkpolicies`), a non-secret ConfigMap, and a
 single-replica Deployment with `/healthz` and `/readyz` probes. NATS
-credentials are injected from a Secret that is never committed; the sandbox
-Pods the manager creates carry no service-account token and expose no inbound
-Service, so every agent command transits the authenticated manager relay.
+credentials are injected from a Secret that is never committed. Sandbox Pod
+manifests produced by the library carry no service-account token and expose no
+inbound Service, so the intended command path is the authenticated manager
+relay.
 
-A rollback disables new relay admission before reverting the manager image and
-never restores the deleted direct sandbox exposure (AC-026). See
-`deploy/kubernetes/runbook.md` for deploy, health, restart-under-traffic, and
-rollback procedures.
+See `deploy/kubernetes/runbook.md` for the remaining runtime-composition gate,
+deployment checks, and rollback procedure.
 
 ## Development
 
 ~~~bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install --editable .
+python -m pip install --editable '.[dev]'
 python -m unittest discover -s tests -v
+ruff check .
+ruff format --check .
+mypy
 ~~~
 
 The service has no third-party runtime dependencies. After installation, and

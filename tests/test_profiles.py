@@ -64,6 +64,7 @@ class SandboxProfileTests(unittest.TestCase):
     def test_validates_profile_contract(self) -> None:
         cases: dict[str, dict[str, object]] = {
             "schema version": {"schema_version": 2},
+            "boolean schema version": {"schema_version": True},
             "profile version": {"profile_version": 0},
             "empty command": {"command": ()},
             "string command": {"command": "python"},

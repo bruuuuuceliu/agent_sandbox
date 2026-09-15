@@ -1,7 +1,7 @@
 """Path-safe workspace resolution for relay file transfers.
 
 ``/workspace`` is ephemeral and dies with the Pod; ``/results`` is the
-retained PVC and is never used as a transfer staging area (plan Section 5.3).
+retained PVC and is never used as a transfer staging area.
 Uploads are confined beneath the configured workspace root, downloads beneath
 explicitly readable roots. Absolute paths, ``..`` traversal, symlink escapes,
 and special files are rejected.
@@ -175,7 +175,7 @@ def checksum_bytes(data: bytes) -> str:
 
 
 class CommandWorkspace(Protocol):
-    """The 4b upload and download surface built on this module."""
+    """Upload and download operations built on the approved workspace layout."""
 
     async def upload(
         self,

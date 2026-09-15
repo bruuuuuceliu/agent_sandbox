@@ -124,6 +124,38 @@ NATS_URL=nats://localhost:15181
                 self.assertIn(message, str(raised.exception))
                 self.assertNotIn("do-not-leak", str(raised.exception))
 
+    def test_validate_rejects_unusable_nats_urls_without_exposing_credentials(
+        self,
+    ) -> None:
+        invalid_urls = {
+            "TLS transport": "tls://agent:do-not-leak@nats:4222",
+            "WebSocket transport": "ws://agent:do-not-leak@nats:4222",
+            "secure WebSocket transport": "wss://agent:do-not-leak@nats:4222",
+            "missing hostname": "nats://agent:do-not-leak@:4222",
+            "invalid hostname": "nats://agent:do-not-leak@bad_host:4222",
+            "missing port": "nats://agent:do-not-leak@nats",
+            "zero port": "nats://agent:do-not-leak@nats:0",
+            "invalid port": "nats://agent:do-not-leak@nats:not-a-port",
+            "missing username": "nats://:do-not-leak@nats:4222",
+            "unsafe username": "nats://agent.name:do-not-leak@nats:4222",
+            "missing password": "nats://agent@nats:4222",
+            "empty password": "nats://agent:@nats:4222",
+            "path": "nats://agent:do-not-leak@nats:4222/account",
+            "query": "nats://agent:do-not-leak@nats:4222?name=value",
+            "fragment": "nats://agent:do-not-leak@nats:4222#fragment",
+            "malformed IPv6": "nats://agent:do-not-leak@[::1:4222",
+        }
+
+        for name, nats_url in invalid_urls.items():
+            with self.subTest(name=name):
+                values = valid_values()
+                values["NATS_URL"] = nats_url
+                with self.assertRaises(ConfigError) as raised:
+                    validate_config(values)
+                message = str(raised.exception)
+                self.assertIn("NATS_URL", message)
+                self.assertNotIn("do-not-leak", message)
+
     def test_load_config_applies_environment_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "local.config")

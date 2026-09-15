@@ -8,7 +8,7 @@
 # manager principal is the only identity that can reach `pods/exec`.
 #
 # The `pods/exec` capability is the relay privilege: it is bound to one fixed,
-# qualified helper command (Decision 17 / KR-009), and argv never appears in a
+# qualified helper command, and argv never appears in a
 # request URL, header, or audit record. `pods/get`, `pods/exec`, and the
 # workload resource lifecycle are the approved resources and subresources
 # recorded for the staging API-audit assertion.

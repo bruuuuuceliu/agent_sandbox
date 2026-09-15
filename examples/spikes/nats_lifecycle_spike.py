@@ -3,7 +3,7 @@
 Exercises the shipped components — ``JetStream``,
 ``JetStreamSpawnIntake``, and ``JetStreamReadyPublisher`` — against the
 local NATS container with JetStream enabled (``examples/local/compose.yaml``,
-nats:2.11, single-user auth) instead of the in-process test fake:
+nats:2.11, separate manager/agent ACLs) instead of the in-process test fake:
 
 1. A spawn request published while no intake is running is durable: it waits
    in the stream and is consumed, acknowledged, and deduplicated only after
@@ -25,7 +25,7 @@ nats:2.11, single-user auth) instead of the in-process test fake:
 
 Run with the local container up:
 
-    PYTHONPATH=src python3 examples/spikes/nats_lifecycle_spike.py
+    python3 -m examples.spikes.nats_lifecycle_spike
 
 Credentials come from ``config/local.env`` (git-ignored, local only). Evidence
 lines are payload-free: identifiers, sizes, counts, and outcomes only.
@@ -81,6 +81,10 @@ _HOST = "127.0.0.1"
 _PORT = 15181
 
 _TIMEOUT = 10.0
+
+_MANAGER_USER = "sandbox-manager"
+
+_AGENT_USER = "sandbox-agent-local"
 
 
 class SpikeNatsError(RuntimeError):
@@ -176,28 +180,30 @@ async def _until(condition: Callable[[], bool], what: str, timeout: float = 15.0
 class LifecycleHarness:
     """One manager and one agent connection over the real JetStream server."""
 
-    def __init__(self, username: str, password: str) -> None:
+    def __init__(self, manager_password: str, agent_password: str) -> None:
         self.run = secrets.token_hex(4)
-        self.principal = f"spike-{self.run}"
+        self.principal = _AGENT_USER
         self.spawn_stream = f"SANDBOX_SPAWN_{self.run.upper()}"
         self.ready_stream = f"SANDBOX_READY_{self.run.upper()}"
         self.command_stream = f"SANDBOX_COMMANDS_{self.run.upper()}"
         self.durable = f"intake-{self.run}"
-        self._username = username
-        self._password = password
+        self._manager_password = manager_password
+        self._agent_password = agent_password
         self.manager: AsyncNatsConnection | None = None
         self.agent: AsyncNatsConnection | None = None
         self.jetstream: JetStream | None = None
+        self.agent_jetstream: JetStream | None = None
         self.intake: JetStreamSpawnIntake | None = None
 
     async def start(self) -> None:
         self.manager = await _connect(
-            self._username, self._password, f"spike-manager-{self.run}"
+            _MANAGER_USER, self._manager_password, f"spike-manager-{self.run}"
         )
         self.jetstream = JetStream(self.manager)
         self.agent = await _connect(
-            self._username, self._password, f"spike-agent-{self.run}"
+            _AGENT_USER, self._agent_password, f"spike-agent-{self.run}"
         )
+        self.agent_jetstream = JetStream(self.agent)
 
     async def stop(self) -> None:
         if self.intake is not None:
@@ -295,11 +301,11 @@ def _admission(principal: str, task_id: str, command_id: str, fence: str) -> Adm
 
 
 async def scenario_backlog_survives_until_intake_starts(
-    username: str, password: str
+    manager_password: str, agent_password: str
 ) -> list[str]:
     """A spawn published with no intake running is durable until consumption."""
 
-    harness = LifecycleHarness(username, password)
+    harness = LifecycleHarness(manager_password, agent_password)
     await harness.start()
     try:
         assert harness.jetstream is not None and harness.agent is not None
@@ -329,24 +335,24 @@ async def scenario_backlog_survives_until_intake_starts(
 
 
 async def scenario_intake_round_trip_with_dedup(
-    username: str, password: str
+    manager_password: str, agent_password: str
 ) -> list[str]:
     """Message-ID dedup stores one copy; the delivery is explicitly acked."""
 
-    harness = LifecycleHarness(username, password)
+    harness = LifecycleHarness(manager_password, agent_password)
     await harness.start()
     try:
-        assert harness.jetstream is not None
+        assert harness.agent_jetstream is not None
         repository = SpikeRepository()
         harness.intake = harness.intake_for(repository, RecordingObserver())
         await harness.intake.start()
         subject = spawn_subject(harness.principal)
-        first = await harness.jetstream.publish(
+        first = await harness.agent_jetstream.publish(
             subject,
             _spawn_payload(harness.principal, "task-round-trip"),
             msg_id=f"request-{harness.run}",
         )
-        duplicate = await harness.jetstream.publish(
+        duplicate = await harness.agent_jetstream.publish(
             subject,
             _spawn_payload(harness.principal, "task-round-trip"),
             msg_id=f"request-{harness.run}",
@@ -369,11 +375,11 @@ async def scenario_intake_round_trip_with_dedup(
 
 
 async def scenario_principal_mismatch_is_terminated(
-    username: str, password: str
+    manager_password: str, agent_password: str
 ) -> list[str]:
     """A payload claiming another principal is terminated, not redelivered."""
 
-    harness = LifecycleHarness(username, password)
+    harness = LifecycleHarness(manager_password, agent_password)
     await harness.start()
     try:
         assert harness.jetstream is not None and harness.agent is not None
@@ -403,11 +409,11 @@ async def scenario_principal_mismatch_is_terminated(
 
 
 async def scenario_transient_failure_redelivers(
-    username: str, password: str
+    manager_password: str, agent_password: str
 ) -> list[str]:
     """A repository outage is negatively acknowledged, then redelivered."""
 
-    harness = LifecycleHarness(username, password)
+    harness = LifecycleHarness(manager_password, agent_password)
     await harness.start()
     try:
         assert harness.jetstream is not None and harness.agent is not None
@@ -433,11 +439,11 @@ async def scenario_transient_failure_redelivers(
 
 
 async def scenario_ready_publication_is_durable(
-    username: str, password: str
+    manager_password: str, agent_password: str
 ) -> list[str]:
     """Ready responses land on the deterministic subject and deduplicate."""
 
-    harness = LifecycleHarness(username, password)
+    harness = LifecycleHarness(manager_password, agent_password)
     await harness.start()
     try:
         assert harness.jetstream is not None and harness.agent is not None
@@ -470,11 +476,11 @@ async def scenario_ready_publication_is_durable(
 
 
 async def scenario_pull_expiry_returns_promptly(
-    username: str, password: str
+    manager_password: str, agent_password: str
 ) -> list[str]:
     """An expiring pull window over an empty stream returns no delivery."""
 
-    harness = LifecycleHarness(username, password)
+    harness = LifecycleHarness(manager_password, agent_password)
     await harness.start()
     try:
         assert harness.jetstream is not None
@@ -504,11 +510,11 @@ async def scenario_pull_expiry_returns_promptly(
 
 
 async def scenario_command_events_survive_restart(
-    username: str, password: str
+    manager_password: str, agent_password: str
 ) -> list[str]:
     """Journaled admission transitions rebuild under a new fence."""
 
-    harness = LifecycleHarness(username, password)
+    harness = LifecycleHarness(manager_password, agent_password)
     await harness.start()
     try:
         assert harness.jetstream is not None
@@ -584,7 +590,7 @@ async def _load_credentials() -> tuple[str, str]:
             key, _, value = line.partition("=")
             values[key.strip()] = value.strip()
     try:
-        return values["NATS_USERNAME"], values["NATS_PASSWORD"]
+        return values["NATS_MANAGER_PASSWORD"], values["NATS_AGENT_PASSWORD"]
     except KeyError as error:
         raise SpikeNatsError(
             f"config/local.env is missing {error}; start the local environment first"
@@ -592,35 +598,49 @@ async def _load_credentials() -> tuple[str, str]:
 
 
 async def _run() -> int:
-    username, password = await _load_credentials()
+    manager_password, agent_password = await _load_credentials()
     scenarios: list[tuple[str, Callable[[], Awaitable[list[str]]]]] = [
         (
             "backlog_survives_until_intake_starts",
-            lambda: scenario_backlog_survives_until_intake_starts(username, password),
+            lambda: scenario_backlog_survives_until_intake_starts(
+                manager_password, agent_password
+            ),
         ),
         (
             "intake_round_trip_with_dedup",
-            lambda: scenario_intake_round_trip_with_dedup(username, password),
+            lambda: scenario_intake_round_trip_with_dedup(
+                manager_password, agent_password
+            ),
         ),
         (
             "principal_mismatch_is_terminated",
-            lambda: scenario_principal_mismatch_is_terminated(username, password),
+            lambda: scenario_principal_mismatch_is_terminated(
+                manager_password, agent_password
+            ),
         ),
         (
             "transient_failure_redelivers",
-            lambda: scenario_transient_failure_redelivers(username, password),
+            lambda: scenario_transient_failure_redelivers(
+                manager_password, agent_password
+            ),
         ),
         (
             "ready_publication_is_durable",
-            lambda: scenario_ready_publication_is_durable(username, password),
+            lambda: scenario_ready_publication_is_durable(
+                manager_password, agent_password
+            ),
         ),
         (
             "pull_expiry_returns_promptly",
-            lambda: scenario_pull_expiry_returns_promptly(username, password),
+            lambda: scenario_pull_expiry_returns_promptly(
+                manager_password, agent_password
+            ),
         ),
         (
             "command_events_survive_restart",
-            lambda: scenario_command_events_survive_restart(username, password),
+            lambda: scenario_command_events_survive_restart(
+                manager_password, agent_password
+            ),
         ),
     ]
 

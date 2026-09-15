@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal, cast
 
+from .identifiers import is_identifier
+
 RELAY_SCHEMA_VERSION: Literal[1] = 1
 
 #: Fixed maximum size of one encoded data frame, envelope to end.
@@ -19,6 +21,7 @@ MAX_FRAME_PAYLOAD_BYTES = MAX_FRAME_BYTES - 64
 MAX_DECLARED_BYTES = 256 * 1024 * 1024
 
 _FRAME_HEADER_BUDGET = MAX_FRAME_BYTES - MAX_FRAME_PAYLOAD_BYTES
+_MAX_LENGTH_PREFIX_VALUE = (1 << 16) - 1
 
 _REQUIRED_ENVELOPE_FIELDS = frozenset(
     {
@@ -103,13 +106,16 @@ class CommandEnvelope:
     declared_output_bytes: int
 
     def __post_init__(self) -> None:
-        if self.schema_version != RELAY_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != RELAY_SCHEMA_VERSION
+        ):
             raise RelayProtocolError(
                 f"unsupported relay schema version: {self.schema_version}"
             )
-        _require_text(self.command_id, "command ID")
-        _require_text(self.task_id, "task ID")
-        _require_text(self.correlation_id, "correlation ID")
+        _require_identifier(self.command_id, "command ID")
+        _require_identifier(self.task_id, "task ID")
+        _require_identifier(self.correlation_id, "correlation ID")
         if not isinstance(self.operation, RelayOperation):
             raise RelayProtocolError("operation must be a relay operation")
         _require_size(self.declared_input_bytes, "declared input size")
@@ -179,10 +185,10 @@ def decode_command_envelope(payload: bytes | str) -> CommandEnvelope:
 
     return CommandEnvelope(
         schema_version=RELAY_SCHEMA_VERSION,
-        command_id=_required_text(values, "command_id"),
-        task_id=_required_text(values, "task_id"),
+        command_id=_required_identifier(values, "command_id"),
+        task_id=_required_identifier(values, "task_id"),
         operation=parsed_operation,
-        correlation_id=_required_text(values, "correlation_id"),
+        correlation_id=_required_identifier(values, "correlation_id"),
         declared_input_bytes=_require_size_value(values, "declared_input_bytes"),
         declared_output_bytes=_require_size_value(values, "declared_output_bytes"),
     )
@@ -198,7 +204,7 @@ class DataFrame:
     payload: bytes = field(repr=False)
 
     def __post_init__(self) -> None:
-        _require_text(self.command_id, "command ID")
+        _require_identifier(self.command_id, "command ID")
         if not isinstance(self.channel, DataChannel):
             raise RelayProtocolError("data channel must be a relay channel")
         if type(self.sequence) is not int or self.sequence < 0:
@@ -219,11 +225,14 @@ class CancelSignal:
     command_id: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != RELAY_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != RELAY_SCHEMA_VERSION
+        ):
             raise RelayProtocolError(
                 f"unsupported relay schema version: {self.schema_version}"
             )
-        _require_text(self.command_id, "command ID")
+        _require_identifier(self.command_id, "command ID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,15 +245,18 @@ class TerminalFrame:
     reason_code: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != RELAY_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != RELAY_SCHEMA_VERSION
+        ):
             raise RelayProtocolError(
                 f"unsupported relay schema version: {self.schema_version}"
             )
-        _require_text(self.command_id, "command ID")
+        _require_identifier(self.command_id, "command ID")
         if not isinstance(self.outcome, CommandOutcome):
             raise RelayProtocolError("terminal outcome must be a command outcome")
         if self.reason_code is not None:
-            _require_text(self.reason_code, "reason code")
+            _require_wire_text(self.reason_code, "reason code")
 
 
 RelayFrame = DataFrame | CancelSignal | TerminalFrame
@@ -377,7 +389,7 @@ class FrameSequencer:
     """Enforces gap-free, duplicate-free frame order per channel."""
 
     def __init__(self, command_id: str) -> None:
-        _require_text(command_id, "command ID")
+        _require_identifier(command_id, "command ID")
         self._command_id = command_id
         self._expected: dict[DataChannel, int] = {}
 
@@ -401,13 +413,13 @@ class OutcomeReport:
     reason_code: str | None = None
 
     def __post_init__(self) -> None:
-        _require_text(self.command_id, "command ID")
+        _require_identifier(self.command_id, "command ID")
         if not isinstance(self.outcome, CommandOutcome):
             raise RelayProtocolError("outcome must be a command outcome")
         if self.outcome not in _TERMINAL_OUTCOMES:
             raise RelayProtocolError("outcome must be terminal")
         if self.reason_code is not None:
-            _require_text(self.reason_code, "reason code")
+            _require_wire_text(self.reason_code, "reason code")
 
 
 def _take_length_prefixed_raw(raw: bytes, offset: int, width: int) -> tuple[bytes, int]:
@@ -442,7 +454,7 @@ def _take_length_prefixed(
         text = value.decode("ascii")
     except UnicodeDecodeError as error:
         raise RelayProtocolError("relay frame identifiers must be ASCII") from error
-    _require_text(text, "frame identifier")
+    _require_wire_text(text, "frame text")
     return text, value_end
 
 
@@ -452,6 +464,7 @@ def _take_required_text(raw: bytes, offset: int, width: int) -> tuple[str, int]:
     text, value_end = _take_length_prefixed(raw, offset, width)
     if text is None:  # pragma: no cover - only the optional variant returns None
         raise RelayProtocolError("relay frame identifiers must be ASCII")
+    _require_identifier(text, "frame identifier")
     return text, value_end
 
 
@@ -473,11 +486,36 @@ def _required_text(values: dict[str, object], field: str) -> str:
     return value
 
 
+def _required_identifier(values: dict[str, object], field: str) -> str:
+    value = values[field]
+    if not is_identifier(value):
+        raise RelayProtocolError(
+            f"{field} must contain 1-64 ASCII letters, digits, underscores, or hyphens"
+        )
+    return value
+
+
 def _require_text(value: str, field: str) -> None:
     if not isinstance(value, str) or not value or value != value.strip():
         raise RelayProtocolError(f"{field} must be a non-empty string")
     if any(ord(character) < 32 for character in value):
         raise RelayProtocolError(f"{field} contains invalid text")
+
+
+def _require_identifier(value: object, field: str) -> None:
+    if not is_identifier(value):
+        raise RelayProtocolError(
+            f"{field} must contain 1-64 ASCII letters, digits, underscores, or hyphens"
+        )
+
+
+def _require_wire_text(value: object, field: str) -> None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise RelayProtocolError(f"{field} must be a non-empty string")
+    if len(value) > _MAX_LENGTH_PREFIX_VALUE or any(
+        not 32 <= ord(character) <= 126 for character in value
+    ):
+        raise RelayProtocolError(f"{field} must be bounded printable ASCII")
 
 
 def _require_size(value: int, field: str) -> None:

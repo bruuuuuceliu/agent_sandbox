@@ -10,6 +10,8 @@ from sandbox_manager.kubernetes import (
     CPU_REQUEST,
     MEMORY_LIMIT,
     MEMORY_REQUEST,
+    TASK_ANNOTATION,
+    WORKSPACE_MOUNT_PATH,
     KubernetesResourceError,
     SandboxWorkload,
     apply_sandbox_resources,
@@ -24,7 +26,7 @@ _RESOURCE_KINDS = ["PersistentVolumeClaim", "NetworkPolicy", "Pod"]
 def workload(**overrides: object) -> SandboxWorkload:
     values: dict[str, object] = {
         "namespace": "sandboxes",
-        "task_id": "Task:Customer/42",
+        "task_id": "Task_Customer_42",
         "image": _IMAGE,
         "command": ("python", "-m", "sandbox_agent"),
         "runtime_class_name": "runsc",
@@ -66,7 +68,7 @@ class KubernetesResourceTests(unittest.TestCase):
             self.assertLessEqual(len(name), 63)
             self.assertRegex(name, r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
             self.assertEqual(
-                annotations["sandbox-manager.io/task-id"], "Task:Customer/42"
+                annotations[TASK_ANNOTATION], "Task_Customer_42"
             )
 
         other = build_sandbox_resources(workload(task_id="task-customer-42"))
@@ -89,6 +91,10 @@ class KubernetesResourceTests(unittest.TestCase):
         self.assertEqual(pvc_spec["accessModes"], ["ReadWriteOnce"])
         self.assertEqual(pvc_spec["storageClassName"], "encrypted-rwo")
         self.assertIn({"mountPath": "/results", "name": "results"}, mounts)
+        self.assertIn(
+            {"mountPath": WORKSPACE_MOUNT_PATH, "name": "workspace"}, mounts
+        )
+        self.assertIn({"name": "workspace", "emptyDir": {}}, volumes)
         self.assertTrue(any("persistentVolumeClaim" in volume for volume in volumes))
         self.assertFalse(any("hostPath" in volume for volume in volumes))
 
@@ -121,6 +127,28 @@ class KubernetesResourceTests(unittest.TestCase):
         self.assertTrue(cast(bool, container_security["readOnlyRootFilesystem"]))
         self.assertEqual(container_security["capabilities"], {"drop": ["ALL"]})
 
+    def test_pod_uses_workload_resource_overrides(self) -> None:
+        resources = build_sandbox_resources(
+            workload(
+                cpu_request="500m",
+                memory_request="768Mi",
+                cpu_limit="2",
+                memory_limit="1536Mi",
+            )
+        )
+        pod_spec = mapping(resources.pod["spec"])
+        container = mapping(sequence(pod_spec["containers"])[0])
+        resource_budget = mapping(container["resources"])
+
+        self.assertEqual(
+            mapping(resource_budget["requests"]),
+            {"cpu": "500m", "memory": "768Mi"},
+        )
+        self.assertEqual(
+            mapping(resource_budget["limits"]),
+            {"cpu": "2", "memory": "1536Mi"},
+        )
+
     def test_sandbox_exposes_no_inbound_network_surface(self) -> None:
         resources = build_sandbox_resources(workload())
         pod_spec = mapping(resources.pod["spec"])
@@ -149,7 +177,9 @@ class KubernetesResourceTests(unittest.TestCase):
         cases: dict[str, dict[str, object]] = {
             "blank task": {"task_id": ""},
             "control character": {"task_id": "task\n1"},
-            "oversized task": {"task_id": "x" * 129},
+            "oversized task": {"task_id": "x" * 65},
+            "task with dot": {"task_id": "task.customer"},
+            "Unicode task": {"task_id": "task-caf\u00e9"},
             "namespace": {"namespace": "Sandbox"},
             "runtime class": {"runtime_class_name": "RunSC"},
             "runtime class segment": {"runtime_class_name": "runsc..sandbox"},
@@ -157,6 +187,13 @@ class KubernetesResourceTests(unittest.TestCase):
             "mutable image": {"image": "registry.example/sandbox:latest"},
             "string command": {"command": "python"},
             "storage": {"result_storage": "0Gi"},
+            "results at workspace": {"results_mount_path": "/workspace"},
+            "results below workspace": {"results_mount_path": "/workspace/results"},
+            "results contain workspace": {"results_mount_path": "/"},
+            "blank CPU request": {"cpu_request": ""},
+            "blank memory request": {"memory_request": ""},
+            "blank CPU limit": {"cpu_limit": ""},
+            "blank memory limit": {"memory_limit": ""},
         }
 
         for name, overrides in cases.items():

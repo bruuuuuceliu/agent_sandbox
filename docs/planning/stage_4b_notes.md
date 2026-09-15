@@ -96,14 +96,14 @@ naming foreign subjects must fail closed with nothing published to them.
 
 ## Evidence
 
-Local verification, 2026-09-02 (Python 3.12.13, stdlib only, `PYTHONPATH=src`):
+Local verification, 2026-09-02 (Python 3.12.13, stdlib only):
 
 - `python3 -m pytest -q` — 296 tests and 59 subtests passed (229/64 at Stage
   4a close; the net 67 include the NATS API, admission lifecycle, workspace
   transfer, and flow suites, less consolidated Kubernetes resource subtests).
-- `python3 -m ruff check src tests examples/spikes` — all checks passed.
-- `python3 -m mypy --strict src tests` — no issues in 47 source files.
-- `PYTHONPATH=src python3 examples/spikes/nats_command_api_spike.py` — 6/6
+- `python3 -m ruff check sandbox_manager tests examples/spikes` — all checks passed.
+- `python3 -m mypy --strict sandbox_manager tests` — no issues in 47 source files.
+- `python3 -m examples.spikes.nats_command_api_spike` — 6/6
   scenarios passed against the live local container (127.0.0.1:15181,
   nats:2.11 with single-user auth): authenticated principal binding, wrong
   credentials refused, command round trip, wrong-principal refusal,

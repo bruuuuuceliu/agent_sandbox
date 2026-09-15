@@ -80,7 +80,7 @@ The local verification run completed with:
 
 - 112 passing unit and integration tests;
 - Ruff lint and format checks passing;
-- strict MyPy checks passing for `src` and `tests`;
+- strict MyPy checks passing for `sandbox_manager` and `tests`;
 - bytecode compilation passing;
 - a successful wheel build; and
 - a successful non-root Docker image build tagged `agent-sandbox:sprint3`.

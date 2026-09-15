@@ -1,25 +1,9 @@
-"""Thin Kubernetes ``pods/get`` + ``pods/exec`` client for the manager relay.
+"""Kubernetes ``pods/get`` and ``pods/exec`` client for the manager relay.
 
-Rules this client exists to prove (plan Decisions 17, 20, 22; KR-008, KR-009):
-
-- The Pod is read and verified (UID, task annotation, labels, namespace,
-  container, phase) immediately before every ``pods/exec``; a replaced Pod
-  (UID mismatch) is never exec'd into.
-- ``pods/exec`` invokes one fixed, qualified helper path. User argv travels on
-  the exec stdin channel inside a length-prefixed frame and never appears in
-  the request URL, headers, or Kubernetes audit metadata.
-- A lost exec stream is classified as ``UNKNOWN``; only a terminal error
-  channel payload (or its confirmed absence) yields ``SUCCESS`` or ``FAILED``.
-
-In-cluster service-account style configuration (environment host/port, token
-file, CA bundle) is used instead of a kubeconfig. The client is deliberately
-dependency-free: a minimal RFC 6455 WebSocket implementation over an asyncio
-socket with the ``v4.channel.k8s.io`` subprotocol. The framing layer is
-production-grade: fragmented messages are reassembled with control frames
-honoured mid-message, server pings are answered, a proactive keepalive turns
-a silent peer into a prompt stream loss, close codes are surfaced for
-diagnosis, and every protocol violation fails closed. Live streaming
-verification requires a staging cluster and is gated outside this module.
+The client verifies immutable Pod identity immediately before execution and
+invokes one fixed helper path. User arguments travel through the exec stdin
+channel, while lost streams and protocol violations fail closed. In-cluster
+service-account configuration is used instead of a kubeconfig.
 """
 
 from __future__ import annotations
@@ -28,13 +12,15 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import ssl
 import urllib.parse
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
 from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
 from typing import Protocol
 
@@ -44,21 +30,21 @@ from .commands import (
     InputStream,
     OutputSink,
 )
+from .kubernetes import TASK_ANNOTATION
 from .relay_protocol import (
     CancelSignal,
     CommandEnvelope,
     CommandOutcome,
     DataChannel,
     DataFrame,
+    FrameSequencer,
     RelayOperation,
+    RelayProtocolError,
     decode_frame,
 )
 
-#: The only command ever passed to ``pods/exec`` (Decision 17 / KR-009).
+#: The only command ever passed to ``pods/exec``.
 RELAY_HELPER_PATH = "/usr/local/bin/sandbox-relay-helper"
-
-#: Pod annotation carrying the owning task ID (KR-008).
-TASK_ANNOTATION = "sandbox-manager.io/task"
 
 CHANNEL_STDIN = 0
 CHANNEL_STDOUT = 1
@@ -125,7 +111,7 @@ class PodSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class PodVerification:
-    """The durable task record's expectation of its Pod (KR-008)."""
+    """The durable task record's expectation of its Pod."""
 
     expected_uid: str
     task_id: str
@@ -183,15 +169,21 @@ class KubernetesApiConfig:
 
     host: str
     port: int
-    bearer_token: str
+    bearer_token: str = field(repr=False)
     ca_cert_path: str | None = None
     secure: bool = True
+    request_timeout_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         if not self.host or not self.port:
             raise KubernetesExecError("API host and port are required")
         if not self.bearer_token:
             raise KubernetesExecError("bearer token is required")
+        if (
+            not math.isfinite(self.request_timeout_seconds)
+            or self.request_timeout_seconds <= 0
+        ):
+            raise KubernetesExecError("request timeout must be positive")
 
     @classmethod
     def from_service_account(
@@ -225,12 +217,7 @@ class KubernetesApiConfig:
     def ssl_context(self) -> ssl.SSLContext | None:
         if not self.secure:
             return None
-        if self.ca_cert_path:
-            return ssl.create_default_context(cafile=self.ca_cert_path)
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        return context
+        return ssl.create_default_context(cafile=self.ca_cert_path)
 
 
 def build_pod_get_path(namespace: str, name: str) -> str:
@@ -242,7 +229,7 @@ def build_pod_get_path(namespace: str, name: str) -> str:
 def build_exec_path(namespace: str, name: str, container: str, tty: bool) -> str:
     """Return the ``pods/exec`` request path.
 
-    The only command in the query is the fixed qualified helper (KR-009): the
+        The only command in the query is the fixed qualified helper: the
     signature accepts no caller argv, so user data cannot reach the URL, the
     request line, or the Kubernetes API audit log.
     """
@@ -260,7 +247,7 @@ def build_exec_path(namespace: str, name: str, container: str, tty: bool) -> str
 def encode_helper_argv(argv: tuple[str, ...]) -> bytes:
     """Encode one length-prefixed argv frame for the fixed helper's stdin.
 
-    The helper receives argv on its stdin channel only (KR-009): a four-byte
+    The helper receives argv on its stdin channel only: a four-byte
     big-endian length followed by the UTF-8 JSON argument vector.
     """
 
@@ -274,7 +261,7 @@ def classify_termination(
     """Map one terminated exec stream onto a command outcome.
 
     Fail-closed: anything other than a confirmed clean helper exit is
-    ``UNKNOWN`` (Decision 20). A non-zero exit code is a confirmed ``FAILED``.
+    ``UNKNOWN``. A non-zero exit code is a confirmed ``FAILED``.
     """
 
     if not stream_completed or error_payload is None:
@@ -470,14 +457,21 @@ class KubernetesApi:
 
     async def pod_snapshot(self, namespace: str, name: str) -> PodSnapshot:
         path = build_pod_get_path(namespace, name)
-        body = await asyncio.to_thread(self._get_json, path)
+        try:
+            body = await asyncio.to_thread(self._get_json, path)
+        except TimeoutError as error:
+            raise KubernetesExecError("pods/get request timed out") from error
         return _parse_pod_snapshot(namespace, name, body)
 
     async def exec_stream(
         self, namespace: str, name: str, container: str, tty: bool
     ) -> ExecStream:
         path = build_exec_path(namespace, name, container, tty)
-        return await _open_exec_stream(self._config, path)
+        try:
+            async with asyncio.timeout(self._config.request_timeout_seconds):
+                return await _open_exec_stream(self._config, path)
+        except TimeoutError as error:
+            raise KubernetesExecError("pods/exec request timed out") from error
 
     def _get_json(self, path: str) -> object:
         headers = {
@@ -486,10 +480,17 @@ class KubernetesApi:
         }
         if self._config.secure:
             connection: HTTPConnection = HTTPSConnection(
-                self._config.host, self._config.port, context=self._config.ssl_context()
+                self._config.host,
+                self._config.port,
+                timeout=self._config.request_timeout_seconds,
+                context=self._config.ssl_context(),
             )
         else:
-            connection = HTTPConnection(self._config.host, self._config.port)
+            connection = HTTPConnection(
+                self._config.host,
+                self._config.port,
+                timeout=self._config.request_timeout_seconds,
+            )
         try:
             connection.request("GET", path, headers=headers)
             response: HTTPResponse = connection.getresponse()
@@ -557,7 +558,7 @@ class PodLocator(Protocol):
 
 
 class KubernetesCommandRelay:
-    """The Stage 4b relay shape, proven by the Stage 4a spike.
+    """Verify a Pod and relay an admitted command through ``pods/exec``.
 
     Verifies the Pod, execs only the fixed helper, sends argv over the stdin
     channel, and classifies termination fail-closed. The ``input_stream``
@@ -572,7 +573,7 @@ class KubernetesCommandRelay:
 
     def __init__(
         self,
-        api: KubernetesApi,
+        api: KubernetesClient,
         locate: PodLocator,
         stream_deadline_seconds: float = 900.0,
         keepalive_interval: float = 30.0,
@@ -597,6 +598,25 @@ class KubernetesCommandRelay:
         input_stream: InputStream | None,
         output_sink: OutputSink | None = None,
     ) -> CommandResult:
+        try:
+            async with asyncio.timeout(self._deadline):
+                return await self._execute(
+                    command, envelope, input_stream, output_sink
+                )
+        except TimeoutError:
+            return CommandResult(
+                command_id=command.command_id,
+                outcome=CommandOutcome.UNKNOWN,
+                reason_code="deadline_exceeded",
+            )
+
+    async def _execute(
+        self,
+        command: AdmittedCommand,
+        envelope: CommandEnvelope,
+        input_stream: InputStream | None,
+        output_sink: OutputSink | None,
+    ) -> CommandResult:
         target = self._locate(command.task_id)
         if target is None:
             raise KubernetesExecError(f"no pod target for task {command.task_id}")
@@ -613,64 +633,76 @@ class KubernetesCommandRelay:
             tty=envelope.operation is RelayOperation.PTY,
         )
 
-        argv = await _read_argv(input_stream)
-        await stream.send_stdin(encode_helper_argv(argv))
-        if self._keepalive_interval > 0:
-            stream.start_keepalive(self._keepalive_interval, self._pong_timeout)
-
-        stdout_bytes = 0
-        stderr_bytes = 0
-        error_payload: bytes | None = None
-        completed = False
-        reason_code: str | None = None
-        forwarder = asyncio.create_task(_forward_stdin(input_stream, stream))
+        forwarder: asyncio.Task[None] | None = None
+        forwarded: tuple[BaseException | None, ...] = ()
         try:
-            async with asyncio.timeout(self._deadline):
-                async for channel, payload in _frames(stream):
-                    if channel == CHANNEL_STDOUT:
-                        stdout_bytes += len(payload)
-                        if output_sink is not None:
-                            output_sink(CHANNEL_STDOUT, payload)
-                    elif channel == CHANNEL_STDERR:
-                        stderr_bytes += len(payload)
-                        if output_sink is not None:
-                            output_sink(CHANNEL_STDERR, payload)
-                    elif channel == CHANNEL_ERROR:
-                        error_payload = payload
-                        completed = True
-                        break
-                    if stdout_bytes + stderr_bytes > _MAX_STREAM_BYTES:
-                        error_payload = b"spike stream budget exceeded"
-                        completed = True
-                        break
-        except TimeoutError:
-            reason_code = "deadline_exceeded"
+            sequencer = FrameSequencer(command.command_id)
+            argv = await _read_argv(input_stream, sequencer, command.command_id)
+            await stream.send_stdin(encode_helper_argv(argv))
+            if self._keepalive_interval > 0:
+                stream.start_keepalive(self._keepalive_interval, self._pong_timeout)
+
+            stdout_bytes = 0
+            stderr_bytes = 0
+            error_payload: bytes | None = None
+            completed = False
+            forwarder = asyncio.create_task(
+                _forward_stdin(
+                    input_stream,
+                    stream,
+                    sequencer,
+                    command.command_id,
+                    envelope.declared_input_bytes,
+                )
+            )
+            async for channel, payload in _frames(stream):
+                if channel == CHANNEL_STDOUT:
+                    stdout_bytes += len(payload)
+                    _validate_output_size(
+                        stdout_bytes + stderr_bytes,
+                        envelope.declared_output_bytes,
+                    )
+                    if output_sink is not None:
+                        await output_sink(CHANNEL_STDOUT, payload)
+                elif channel == CHANNEL_STDERR:
+                    stderr_bytes += len(payload)
+                    _validate_output_size(
+                        stdout_bytes + stderr_bytes,
+                        envelope.declared_output_bytes,
+                    )
+                    if output_sink is not None:
+                        await output_sink(CHANNEL_STDERR, payload)
+                elif channel == CHANNEL_ERROR:
+                    error_payload = payload
+                    completed = True
+                    break
         finally:
-            forwarder.cancel()
-            forwarded = await asyncio.gather(forwarder, return_exceptions=True)
+            if forwarder is not None:
+                forwarder.cancel()
+                forwarded = await asyncio.gather(forwarder, return_exceptions=True)
             await stream.close()
 
-        failure = forwarded[0]
-        if isinstance(failure, BaseException) and not isinstance(
-            failure, asyncio.CancelledError
-        ):
-            # The input stream failed on its own (a truncated upload, for
-            # example); its typed error outranks the fail-closed result the
-            # closed stream would otherwise produce.
-            raise failure
+        if forwarded:
+            failure = forwarded[0]
+            if isinstance(failure, BaseException) and not isinstance(
+                failure, asyncio.CancelledError
+            ):
+                raise failure
 
         outcome = classify_termination(error_payload, completed)
-        if outcome is CommandOutcome.UNKNOWN and reason_code is None:
-            reason_code = "stream_lost"
         return CommandResult(
             command_id=command.command_id,
             outcome=outcome,
-            reason_code=reason_code if outcome is CommandOutcome.UNKNOWN else None,
+            reason_code="stream_lost" if outcome is CommandOutcome.UNKNOWN else None,
         )
 
 
 async def _forward_stdin(
-    input_stream: InputStream | None, stream: ExecStream
+    input_stream: InputStream | None,
+    stream: ExecStream,
+    sequencer: FrameSequencer,
+    command_id: str,
+    declared_input_bytes: int,
 ) -> None:
     """Stream remaining STDIN frames to the Pod until input ends or cancels.
 
@@ -683,13 +715,23 @@ async def _forward_stdin(
 
     if input_stream is None:
         return
+    forwarded_bytes = 0
     try:
         async for frame_bytes in input_stream:
             frame = decode_frame(frame_bytes)
-            if isinstance(frame, DataFrame) and frame.channel is DataChannel.STDIN:
+            if isinstance(frame, DataFrame):
+                sequencer.observe(frame)
+                if frame.channel is not DataChannel.STDIN:
+                    raise RelayProtocolError("input data must use the STDIN channel")
+                forwarded_bytes += len(frame.payload)
+                if forwarded_bytes > declared_input_bytes:
+                    raise RelayProtocolError("declared input size exceeded")
                 await stream.send_stdin(frame.payload)
             elif isinstance(frame, CancelSignal):
+                _require_command_id(frame.command_id, command_id)
                 return
+            else:
+                raise RelayProtocolError("unsupported relay input frame")
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -697,25 +739,48 @@ async def _forward_stdin(
         raise
 
 
-async def _read_argv(input_stream: InputStream | None) -> tuple[str, ...]:
+async def _read_argv(
+    input_stream: InputStream | None,
+    sequencer: FrameSequencer,
+    command_id: str,
+) -> tuple[str, ...]:
     """Read the argv frame (STDIN sequence 0) from the relay input stream."""
 
     if input_stream is None:
         return ()
     async for frame_bytes in input_stream:
         frame = decode_frame(frame_bytes)
-        if isinstance(frame, DataFrame) and frame.channel is DataChannel.STDIN:
-            if frame.sequence != 0:
-                raise KubernetesExecError("argv must arrive on STDIN sequence 0")
+        if isinstance(frame, CancelSignal):
+            _require_command_id(frame.command_id, command_id)
+            raise RelayProtocolError("first input frame must be STDIN data")
+        if not isinstance(frame, DataFrame):
+            raise RelayProtocolError("first input frame must be STDIN data")
+        sequencer.observe(frame)
+        if frame.channel is not DataChannel.STDIN:
+            raise RelayProtocolError("first input frame must be STDIN data")
+        try:
             payload = json.loads(frame.payload.decode("utf-8"))
-            argv = payload.get("argv", ())
-            if not isinstance(argv, list) or not all(
-                isinstance(item, str) for item in argv
-            ):
-                raise KubernetesExecError("argv frame must carry a string vector")
-            return tuple(argv)
-        raise KubernetesExecError("first input frame must be STDIN data")
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RelayProtocolError("argv frame must contain UTF-8 JSON") from error
+        if not isinstance(payload, dict):
+            raise RelayProtocolError("argv frame must contain a JSON object")
+        argv = payload.get("argv")
+        if not isinstance(argv, list) or not all(
+            isinstance(item, str) for item in argv
+        ):
+            raise RelayProtocolError("argv frame must carry a string vector")
+        return tuple(argv)
     return ()
+
+
+def _require_command_id(observed: str, expected: str) -> None:
+    if observed != expected:
+        raise RelayProtocolError("frame does not belong to this command")
+
+
+def _validate_output_size(observed: int, declared: int) -> None:
+    if observed > min(declared, _MAX_STREAM_BYTES):
+        raise RelayProtocolError("declared output size exceeded")
 
 
 async def _frames(stream: ExecStream) -> AsyncIterator[tuple[int, bytes]]:
@@ -759,52 +824,54 @@ async def _open_exec_stream(
     except OSError as error:
         raise KubernetesExecError("could not reach the API server") from error
 
-    writer.write(request.encode("ascii"))
-    await writer.drain()
-
-    status_line = await reader.readline()
+    stream: ExecStream | None = None
     try:
-        status = int(status_line.split()[1])
-    except (IndexError, ValueError) as error:
-        await _close_writer(writer)
-        raise KubernetesExecError("malformed upgrade response") from error
-    if status != 101:
-        await _close_writer(writer)
-        raise KubernetesExecError(f"exec upgrade refused with {status}")
+        writer.write(request.encode("ascii"))
+        await writer.drain()
 
-    headers: dict[str, str] = {}
-    while True:
-        line = await reader.readline()
-        if line in (b"\r\n", b"\n", b""):
-            break
-        name, _, value = line.partition(b":")
-        headers[name.decode("latin-1").strip().lower()] = value.decode(
-            "latin-1"
-        ).strip()
+        status_line = await reader.readline()
+        try:
+            status = int(status_line.split()[1])
+        except (IndexError, ValueError) as error:
+            raise KubernetesExecError("malformed upgrade response") from error
+        if status != 101:
+            raise KubernetesExecError(f"exec upgrade refused with {status}")
 
-    expected_accept = base64.b64encode(
-        hashlib.sha1(f"{key}{_WS_GUID}".encode("ascii")).digest()
-    ).decode("ascii")
-    if (
-        headers.get("upgrade", "").lower() != "websocket"
-        or headers.get("sec-websocket-accept") != expected_accept
-    ):
-        await _close_writer(writer)
-        raise KubernetesExecError("exec upgrade failed WebSocket validation")
-    if headers.get("sec-websocket-protocol") != _WS_SUBPROTOCOL:
-        await _close_writer(writer)
-        raise KubernetesExecError(
-            "exec upgrade did not confirm the channel subprotocol"
-        )
-    return ExecStream(reader=reader, writer=writer)
+        headers: dict[str, str] = {}
+        while True:
+            line = await reader.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            name, _, value = line.partition(b":")
+            headers[name.decode("latin-1").strip().lower()] = value.decode(
+                "latin-1"
+            ).strip()
+
+        expected_accept = base64.b64encode(
+            hashlib.sha1(f"{key}{_WS_GUID}".encode("ascii")).digest()
+        ).decode("ascii")
+        if (
+            headers.get("upgrade", "").lower() != "websocket"
+            or headers.get("sec-websocket-accept") != expected_accept
+        ):
+            raise KubernetesExecError("exec upgrade failed WebSocket validation")
+        if headers.get("sec-websocket-protocol") != _WS_SUBPROTOCOL:
+            raise KubernetesExecError(
+                "exec upgrade did not confirm the channel subprotocol"
+            )
+        stream = ExecStream(reader=reader, writer=writer)
+        return stream
+    except (ConnectionError, OSError) as error:
+        raise KubernetesExecError("exec upgrade connection failed") from error
+    finally:
+        if stream is None:
+            await _close_writer(writer)
 
 
 async def _close_writer(writer: asyncio.StreamWriter) -> None:
     writer.close()
-    try:
+    with suppress(OSError):
         await writer.wait_closed()
-    except OSError:
-        pass
 
 
 async def _ws_send_frame(
@@ -845,36 +912,51 @@ async def _ws_read_frame(reader: asyncio.StreamReader) -> _WsFrame | None:
     try:
         header = await reader.readexactly(2)
         opcode = header[0] & 0x0F
-        length = header[1] & 0x7F
-        if length == 126:
-            length = int.from_bytes(await reader.readexactly(2), "big")
-        elif length == 127:
-            length = int.from_bytes(await reader.readexactly(8), "big")
+        fin = bool(header[0] & 0x80)
         masked = bool(header[1] & 0x80)
+        length_code = header[1] & 0x7F
+        if header[0] & 0x70:
+            raise KubernetesExecError(
+                "websocket protocol violation (reserved bits set)"
+            )
         if masked:
-            mask = await reader.readexactly(4)
-            payload = _apply_mask(await reader.readexactly(length), mask)
+            raise KubernetesExecError(
+                "websocket protocol violation (masked server frame)"
+            )
+        if opcode in _WS_RESERVED_OPCODES:
+            raise KubernetesExecError(
+                f"websocket protocol violation (reserved opcode 0x{opcode:x})"
+            )
+        if opcode >= 0x8 and (not fin or length_code > _WS_MAX_CONTROL_PAYLOAD):
+            raise KubernetesExecError(
+                "websocket protocol violation "
+                "(fragmented or oversized control frame)"
+            )
+
+        if length_code == 126:
+            length = int.from_bytes(await reader.readexactly(2), "big")
+            if length < 126:
+                raise KubernetesExecError(
+                    "websocket protocol violation (non-canonical frame length)"
+                )
+        elif length_code == 127:
+            extended_length = await reader.readexactly(8)
+            if extended_length[0] & 0x80:
+                raise KubernetesExecError(
+                    "websocket protocol violation (invalid 64-bit frame length)"
+                )
+            length = int.from_bytes(extended_length, "big")
+            if length < 65536:
+                raise KubernetesExecError(
+                    "websocket protocol violation (non-canonical frame length)"
+                )
         else:
-            payload = await reader.readexactly(length)
+            length = length_code
+        if opcode < 0x8 and length > _WS_MAX_MESSAGE_BYTES:
+            raise KubernetesExecError(
+                f"websocket data frame exceeds bound ({length} bytes)"
+            )
+        payload = await reader.readexactly(length)
+        return _WsFrame(fin=fin, opcode=opcode, payload=payload)
     except (asyncio.IncompleteReadError, ConnectionError, OSError):
         return None
-    if masked:
-        raise KubernetesExecError(
-            "websocket protocol violation (masked server frame)"
-        )
-    if header[0] & 0x70:
-        raise KubernetesExecError(
-            "websocket protocol violation (reserved bits set)"
-        )
-    if opcode >= 0x8 and (
-        not header[0] & 0x80 or length > _WS_MAX_CONTROL_PAYLOAD
-    ):
-        raise KubernetesExecError(
-            "websocket protocol violation "
-            "(fragmented or oversized control frame)"
-        )
-    if opcode in _WS_RESERVED_OPCODES:
-        raise KubernetesExecError(
-            f"websocket protocol violation (reserved opcode 0x{opcode:x})"
-        )
-    return _WsFrame(fin=bool(header[0] & 0x80), opcode=opcode, payload=payload)

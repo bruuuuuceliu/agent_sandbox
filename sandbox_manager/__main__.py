@@ -51,13 +51,13 @@ def run(arguments: Sequence[str] | None = None) -> None:
         signum: signal.signal(signum, request_shutdown)
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
-    readiness.set(True)
     _log(
-        "INFO",
-        "sandbox manager started",
+        "WARNING",
+        "sandbox manager runtime is not composed",
         environment=config.app_env.value,
         port=config.manager_port,
         max_sandboxes=config.max_sandboxes,
+        ready=False,
     )
 
     try:

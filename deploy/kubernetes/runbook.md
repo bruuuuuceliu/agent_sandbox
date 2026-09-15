@@ -124,3 +124,34 @@ The NATS credentials are injected as environment variables from the
 `sandbox-manager-nats` Secret; `NATS_URL` in the ConfigMap expands them. A
 manager that cannot read the Secret fails at startup (missing NATS_URL) rather
 than starting unauthenticated.
+
+## Production NATS ACL Contract
+
+Provision a distinct manager credential and a distinct credential for every
+agent principal. Never share the manager credential with an agent or reuse one
+agent credential for another principal. Every username must match
+`[A-Za-z0-9_-]{1,64}` because the authenticated username is also its NATS
+subject namespace.
+
+Grant the manager credential only these subject permissions:
+
+| Operation | Allowed subjects |
+| --- | --- |
+| Publish | `$JS.API.>`, `$JS.ACK.>`, `sandbox.inbox.*.>`, `sandbox.agent.*.task.*.*.out`, `sandbox.manager.*.task.*.ready`, `sandbox.manager.command.event` |
+| Subscribe | `sandbox.inbox.<manager-principal>.>`, `sandbox.agent.*.admit`, `sandbox.agent.*.task.*.*.in`, `sandbox.agent.*.task.*.*.closed` |
+
+For an agent credential whose authenticated username is `<principal>`, grant
+only these permissions after replacing the placeholder with that exact
+username:
+
+| Operation | Allowed subjects |
+| --- | --- |
+| Publish | `sandbox.agent.<principal>.spawn`, `sandbox.agent.<principal>.admit`, `sandbox.agent.<principal>.task.*.*.in`, `sandbox.agent.<principal>.task.*.*.closed` |
+| Subscribe | `sandbox.inbox.<principal>.>`, `sandbox.agent.<principal>.task.*.*.out`, `sandbox.manager.<principal>.task.*.ready` |
+
+Do not grant either identity a bare `>` publish or subscribe permission, and do
+not grant an agent wildcard access to another principal's `sandbox.agent`,
+`sandbox.manager`, or `sandbox.inbox` namespace. Keep NATS monitoring and
+client listeners cluster-internal, issue credentials through the approved
+secret system, and test both permitted traffic and cross-principal denials
+before rollout or credential rotation.

@@ -36,8 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from .commands import (
@@ -47,9 +46,11 @@ from .commands import (
     CommandOwnershipError,
     CommandPersistenceError,
     CommandResult,
+    OutputSink,
     PolicyDeniedError,
     TaskNotAdmissibleError,
 )
+from .identifiers import is_identifier
 from .nats_client import (
     AsyncNatsConnection,
     NatsClosedError,
@@ -73,8 +74,6 @@ from .relay_protocol import (
     encode_frame,
 )
 
-_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
 _AGENT_PREFIX = "sandbox.agent"
 
 _ADMIT_SUFFIX = "admit"
@@ -96,7 +95,7 @@ class NatsRelayError(RuntimeError):
 def require_subject_token(value: str, field: str) -> str:
     """Validate one subject token so identifiers cannot split a subject."""
 
-    if not isinstance(value, str) or not _TOKEN_PATTERN.fullmatch(value):
+    if not is_identifier(value):
         raise NatsRelayError(f"{field} must be a short single subject token")
     return value
 
@@ -214,8 +213,18 @@ class NatsCommandServer:
     async def start(self) -> None:
         """Subscribe every agent's admission subject and serve requests."""
 
+        if self._admit_task is not None:
+            raise NatsRelayError("command server is already started")
+        subscription = await self._connection.subscribe(
+            f"{_AGENT_PREFIX}.*.{_ADMIT_SUFFIX}", self._pending_limit
+        )
+        try:
+            await self._connection.flush()
+        except BaseException:
+            await _unsubscribe_quietly(self._connection, subscription)
+            raise
         self._admit_task = asyncio.create_task(
-            self._serve_admissions(), name="nats-admissions"
+            self._serve_admissions(subscription), name="nats-admissions"
         )
 
     async def stop(self) -> None:
@@ -231,14 +240,16 @@ class NatsCommandServer:
         await asyncio.gather(*sessions, return_exceptions=True)
         self._sessions.clear()
 
-    async def _serve_admissions(self) -> None:
-        subscription = await self._connection.subscribe(
-            f"{_AGENT_PREFIX}.*.{_ADMIT_SUFFIX}", self._pending_limit
-        )
+    async def _serve_admissions(self, subscription: NatsSubscription) -> None:
         try:
             while True:
                 message = await subscription.queue.get()
-                await self._handle_admission(message)
+                try:
+                    await self._handle_admission(message)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - isolate malformed requests
+                    continue
         finally:
             await _unsubscribe_quietly(self._connection, subscription)
 
@@ -283,44 +294,55 @@ class NatsCommandServer:
             await self._reply(message.reply, AdmissionReply(False, refusal=error.refusal.value))
             return
 
-        input_subject, closed_subject, output_subject = task_subjects(
-            principal, envelope.task_id, envelope.command_id
-        )
+        input_sub: NatsSubscription | None = None
+        closed_sub: NatsSubscription | None = None
+        session_started = False
         try:
-            # The input subscriptions are opened before the grant is sent:
-            # both travel the manager's connection in order, so by the time
-            # the agent can possibly publish a frame its subscriber already
-            # exists and at-most-once delivery cannot drop it.
+            input_subject, closed_subject, output_subject = task_subjects(
+                principal, envelope.task_id, envelope.command_id
+            )
             input_sub = await self._connection.subscribe(
                 input_subject, self._pending_limit
             )
             closed_sub = await self._connection.subscribe(
                 closed_subject, self._pending_limit
             )
-        except (NatsTransportError, NatsClosedError):
-            return  # transport gone; the agent classifies UNKNOWN
-        await self._reply(
-            message.reply,
-            AdmissionReply(
-                True,
-                input_subject=input_subject,
-                closed_subject=closed_subject,
-                output_subject=output_subject,
-            ),
-        )
-        session = asyncio.create_task(
-            self._run_session(
-                admission,
-                envelope,
-                principal,
-                input_sub,
-                closed_sub,
-                output_subject,
-            ),
-            name=f"nats-command-{envelope.command_id}",
-        )
-        self._sessions.add(session)
-        session.add_done_callback(self._sessions.discard)
+            replied = await self._reply(
+                message.reply,
+                AdmissionReply(
+                    True,
+                    input_subject=input_subject,
+                    closed_subject=closed_subject,
+                    output_subject=output_subject,
+                ),
+            )
+            if not replied:
+                return
+            session = asyncio.create_task(
+                self._run_session(
+                    admission,
+                    envelope,
+                    principal,
+                    input_sub,
+                    closed_sub,
+                    output_subject,
+                ),
+                name=f"nats-command-{envelope.command_id}",
+            )
+            self._sessions.add(session)
+            session.add_done_callback(self._sessions.discard)
+            session_started = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - admitted work must fail closed
+            return
+        finally:
+            if not session_started:
+                if closed_sub is not None:
+                    await _unsubscribe_quietly(self._connection, closed_sub)
+                if input_sub is not None:
+                    await _unsubscribe_quietly(self._connection, input_sub)
+                await self._gate.abandon(admission, envelope, principal)
 
     async def _run_session(
         self,
@@ -332,9 +354,8 @@ class NatsCommandServer:
         output_subject: str,
     ) -> None:
         sequences: dict[int, int] = {}
-        publications: set[asyncio.Task[None]] = set()
 
-        def output_sink(channel: int, payload: bytes) -> None:
+        async def output_sink(channel: int, payload: bytes) -> None:
             sequence = sequences.get(channel, 0)
             sequences[channel] = sequence + 1
             frame = encode_frame(
@@ -345,11 +366,7 @@ class NatsCommandServer:
                     payload,
                 )
             )
-            publication = asyncio.create_task(
-                self._safe_publish(output_subject, frame)
-            )
-            publications.add(publication)
-            publication.add_done_callback(publications.discard)
+            await self._connection.publish(output_subject, frame)
 
         try:
             result = await self._gate.run_admitted(
@@ -359,16 +376,8 @@ class NatsCommandServer:
                 _merged_input(input_sub.queue, closed_sub.queue),
                 output_sink,
             )
-            # The sink could only schedule its publishes; they must reach the
-            # agent before the terminal frame, or the agent stops listening
-            # and classifies the command as a stream that ended early.
-            if publications:
-                await asyncio.gather(*list(publications))
             await self._publish_terminal(output_subject, result)
         finally:
-            for publication in list(publications):
-                publication.cancel()
-            await asyncio.gather(*publications, return_exceptions=True)
             await _unsubscribe_quietly(self._connection, input_sub)
             await _unsubscribe_quietly(self._connection, closed_sub)
 
@@ -393,11 +402,12 @@ class NatsCommandServer:
             # agent will classify as UNKNOWN. Never re-issue.
             return
 
-    async def _reply(self, subject: str, reply: AdmissionReply) -> None:
+    async def _reply(self, subject: str, reply: AdmissionReply) -> bool:
         try:
             await self._connection.publish(subject, reply.encode())
         except (NatsTransportError, NatsClosedError):
-            return
+            return False
+        return True
 
 
 async def _merged_input(
@@ -466,7 +476,7 @@ class NatsCommandClient:
         self,
         envelope: CommandEnvelope,
         input_frames: AsyncIterator[bytes] | None,
-        on_output: Callable[[int, bytes], None] | None = None,
+        on_output: OutputSink | None = None,
         admission_timeout: float = 5.0,
         terminal_timeout: float = 30.0,
     ) -> RelayCommandResult:
@@ -559,7 +569,7 @@ class NatsCommandClient:
         command_id: str,
         subscription: NatsSubscription,
         sequencer: FrameSequencer,
-        on_output: Callable[[int, bytes], None] | None,
+        on_output: OutputSink | None,
         timeout: float,
     ) -> RelayCommandResult:
         while True:
@@ -577,16 +587,16 @@ class NatsCommandClient:
                 return RelayCommandResult(
                     command_id, CommandOutcome.UNKNOWN, "malformed_frame"
                 )
-            outcome = _consume_frame(frame, command_id, sequencer, on_output)
+            outcome = await _consume_frame(frame, command_id, sequencer, on_output)
             if outcome is not None:
                 return outcome
 
 
-def _consume_frame(
+async def _consume_frame(
     frame: RelayFrame,
     command_id: str,
     sequencer: FrameSequencer,
-    on_output: Callable[[int, bytes], None] | None,
+    on_output: OutputSink | None,
 ) -> RelayCommandResult | None:
     """Observe one output frame; return a terminal result when it is one."""
 
@@ -608,5 +618,5 @@ def _consume_frame(
                 command_id, CommandOutcome.UNKNOWN, "frame_sequence_gap"
             )
         if on_output is not None:
-            on_output(data_channel_index(frame.channel), frame.payload)
+            await on_output(data_channel_index(frame.channel), frame.payload)
     return None

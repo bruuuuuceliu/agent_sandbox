@@ -53,7 +53,7 @@ def profile() -> SandboxProfile:
         sandbox_type="python",
         image=_IMAGE,
         command=("python", "-m", "sandbox_agent"),
-        volume_mounts=(ProfileMount("results", "/workspace/results"),),
+        volume_mounts=(ProfileMount("results", "/results"),),
     )
 
 
@@ -195,7 +195,7 @@ class KubernetesSandboxProvisionerTests(unittest.IsolatedAsyncioTestCase):
         container = manifest_mapping(cast(list[object], pod_spec["containers"])[0])
         self.assertEqual(container["command"], ["python", "-m", "sandbox_agent"])
         self.assertIn(
-            {"mountPath": "/workspace/results", "name": "results"},
+            {"mountPath": "/results", "name": "results"},
             cast(list[object], container["volumeMounts"]),
         )
         self.assertEqual(client.ready_waits, [("sandboxes", name)])
@@ -211,6 +211,37 @@ class KubernetesSandboxProvisionerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result.ready_task.resources.result_volume_uid,
             f"uid-persistentvolumeclaim-{name}",
+        )
+
+    async def test_resource_overrides_flow_into_the_pod(self) -> None:
+        client = RecordingKubernetesClient()
+        adapter = KubernetesSandboxProvisioner(
+            KubernetesProvisionerConfig(
+                namespace="sandboxes",
+                runtime_class_name="runsc",
+                storage_class_name="encrypted-rwo",
+                result_storage="2Gi",
+                readiness_timeout=timedelta(seconds=60),
+                cpu_request="750m",
+                memory_request="1Gi",
+                cpu_limit="3",
+                memory_limit="2Gi",
+            ),
+            client,
+        )
+
+        await adapter.provision(ProvisioningTask(queued_task(), profile()))
+
+        name = sandbox_resource_name("task-1")
+        pod = client.manifests[("v1", "Pod", "sandboxes", name)]
+        pod_spec = manifest_mapping(pod["spec"])
+        container = manifest_mapping(cast(list[object], pod_spec["containers"])[0])
+        resources = manifest_mapping(container["resources"])
+        self.assertEqual(
+            resources["requests"], {"cpu": "750m", "memory": "1Gi"}
+        )
+        self.assertEqual(
+            resources["limits"], {"cpu": "3", "memory": "2Gi"}
         )
 
     async def test_partial_apply_retries_against_existing_resources(self) -> None:

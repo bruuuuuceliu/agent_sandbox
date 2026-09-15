@@ -2,17 +2,16 @@ services:
   nats:
     image: nats:2.11-alpine
     command:
-      - --jetstream
-      - --store_dir=/data
-      - --port=15181
-      - --http_port=15182
-      - --user=${NATS_USERNAME}
-      - --pass=${NATS_PASSWORD}
+      - --config=/etc/nats/nats-server.conf
+    environment:
+      NATS_MANAGER_PASSWORD: ${NATS_MANAGER_PASSWORD}
+      NATS_AGENT_PASSWORD: ${NATS_AGENT_PASSWORD}
     ports:
       - "127.0.0.1:${NATS_CLIENT_PORT:-15181}:15181"
       - "127.0.0.1:${NATS_MONITOR_PORT:-15182}:15182"
     volumes:
       - nats-data:/data
+      - ./nats-server.conf:/etc/nats/nats-server.conf:ro
     restart: unless-stopped
     healthcheck:
       test:
@@ -31,7 +30,7 @@ services:
       - /config/local.config
     environment:
       MANAGER_PORT: ${MANAGER_PORT:-15180}
-      NATS_URL: nats://${NATS_USERNAME}:${NATS_PASSWORD}@nats:15181
+      NATS_URL: nats://sandbox-manager:${NATS_MANAGER_PASSWORD}@nats:15181
     ports:
       - "127.0.0.1:${MANAGER_PORT:-15180}:${MANAGER_PORT:-15180}"
     volumes:

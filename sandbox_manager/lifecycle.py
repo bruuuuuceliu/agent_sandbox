@@ -538,7 +538,7 @@ def _validate_cleanup_progress(
     updated: TerminatingRecord,
     step: CleanupStep,
 ) -> None:
-    expected = previous.completed_steps + (step,)
+    expected = (*previous.completed_steps, step)
     if (
         updated.task_id != previous.task_id
         or updated.running_record != previous.running_record

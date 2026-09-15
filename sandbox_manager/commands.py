@@ -1,6 +1,6 @@
 """Transport-neutral command admission for the manager-mediated relay.
 
-Admission ordering (plan Section 4.3):
+Admission ordering:
 
 1. The transport supplies an authenticated principal separately from the
    envelope; a session ID inside the payload is never evidence of ownership.
@@ -22,8 +22,9 @@ never automatically re-issues an unknown command.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -35,6 +36,7 @@ from .command_policy import (
     PolicyEvaluation,
     PolicyResult,
 )
+from .identifiers import is_identifier
 from .relay_protocol import CommandEnvelope, CommandOutcome, RelayOperation
 
 
@@ -136,10 +138,12 @@ class TaskAdmissionState:
         for value, field_name in (
             (self.task_id, "task ID"),
             (self.agent_session_id, "agent session ID"),
-            (self.profile, "profile"),
             (self.fence_generation, "fence generation"),
         ):
-            _require_text(value, field_name)
+            _require_identifier(value, field_name)
+        _require_text(self.profile, "profile")
+        if self.in_flight_command_id is not None:
+            _require_identifier(self.in_flight_command_id, "in-flight command ID")
         if not isinstance(self.lifecycle, AdmissionLifecycle):
             raise TypeError("lifecycle must be an admission lifecycle")
 
@@ -161,7 +165,7 @@ class AdmissionRequest:
             (self.authenticated_principal, "authenticated principal"),
             (self.fence_generation, "fence generation"),
         ):
-            _require_text(value, field_name)
+            _require_identifier(value, field_name)
         object.__setattr__(self, "admitted_at", _timestamp(self.admitted_at))
 
 
@@ -182,10 +186,12 @@ class AdmittedCommand:
             (self.task_id, "task ID"),
             (self.command_id, "command ID"),
             (self.agent_session_id, "agent session ID"),
-            (self.profile, "profile"),
             (self.fence_generation, "fence generation"),
         ):
-            _require_text(value, field_name)
+            _require_identifier(value, field_name)
+        _require_text(self.profile, "profile")
+        if type(self.activated) is not bool:
+            raise TypeError("activated must be a boolean")
         object.__setattr__(self, "admitted_at", _timestamp(self.admitted_at))
 
 
@@ -209,8 +215,8 @@ class AdmissionRecoveryEntry:
     command_id: str
 
     def __post_init__(self) -> None:
-        _require_text(self.task_id, "task ID")
-        _require_text(self.command_id, "command ID")
+        _require_identifier(self.task_id, "task ID")
+        _require_identifier(self.command_id, "command ID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,17 +315,18 @@ class CommandEvent:
         for field in (
             "task_id",
             "agent_session_id",
-            "profile",
             "fence_generation",
             "command_id",
             "authenticated_principal",
         ):
             value = getattr(self, field)
             if value is not None:
-                _require_text(value, field)
+                _require_identifier(value, field)
+        if self.profile is not None:
+            _require_text(self.profile, "profile")
         if self.outcome is not None and not isinstance(self.outcome, CommandOutcome):
             raise ValueError("outcome must be a command outcome")
-        for value, field_name in (
+        for value, _field_name in (
             (self.admitted_at, "admitted_at"),
             (self.completed_at, "completed_at"),
         ):
@@ -433,11 +440,11 @@ class CommandAuditEntry:
     kubernetes_correlation_id: str | None = None
 
     def __post_init__(self) -> None:
-        _require_text(self.task_id, "task ID")
-        _require_text(self.command_id, "command ID")
+        _require_identifier(self.task_id, "task ID")
+        _require_identifier(self.command_id, "command ID")
         if not isinstance(self.operation, RelayOperation):
             raise TypeError("operation must be a relay operation")
-        _require_text(self.authenticated_principal, "authenticated principal")
+        _require_identifier(self.authenticated_principal, "authenticated principal")
         if type(self.policy_version) is not int or self.policy_version < 0:
             raise ValueError("policy version must be a non-negative integer")
         _require_text(self.decision_reference, "decision reference")
@@ -455,7 +462,7 @@ class CommandAuditEntry:
             ):
                 raise ValueError(f"{field_name} must be a non-negative integer")
         if self.kubernetes_correlation_id is not None:
-            _require_text(
+            _require_identifier(
                 self.kubernetes_correlation_id, "Kubernetes correlation ID"
             )
 
@@ -476,7 +483,7 @@ class CommandResult:
     reason_code: str | None = None
 
     def __post_init__(self) -> None:
-        _require_text(self.command_id, "command ID")
+        _require_identifier(self.command_id, "command ID")
         if not isinstance(self.outcome, CommandOutcome):
             raise TypeError("outcome must be a command outcome")
         if self.reason_code is not None:
@@ -487,10 +494,9 @@ class InputStream(Protocol):
     def __aiter__(self) -> AsyncIterator[bytes]: ...
 
 
-#: Receives each relayed output frame (channel, payload) as it arrives. The
-#: sink must not block; it exists so workspace downloads can stream frames
-#: onward instead of buffering a whole transfer in memory.
-OutputSink = Callable[[int, bytes], None]
+#: Receives each relayed output frame (channel, payload) as it arrives.
+#: Awaiting the sink propagates backpressure through the relay.
+OutputSink = Callable[[int, bytes], Awaitable[None]]
 
 
 class CommandRelay(Protocol):
@@ -534,7 +540,7 @@ class AdmissionFence:
         self._generation = (
             generation if generation is not None else secrets.token_urlsafe(32)
         )
-        _require_text(self._generation, "fence generation")
+        _require_identifier(self._generation, "fence generation")
 
     @property
     def generation(self) -> str:
@@ -604,6 +610,18 @@ class CommandAdmissionGate:
             admission, envelope, principal, input_stream, output_sink
         )
 
+    async def abandon(
+        self,
+        admission: CommandAdmission,
+        envelope: CommandEnvelope,
+        principal: str,
+    ) -> None:
+        """Finish an admitted command as unknown before relay ownership begins."""
+
+        await self._abandon(
+            admission.command, envelope, principal, admission.policy
+        )
+
     async def run(
         self,
         principal: str,
@@ -653,27 +671,28 @@ class CommandAdmissionGate:
             raise CommandPersistenceError(
                 admission.command.task_id, "finish", error
             ) from error
-        await self._audit.record(
-            CommandAuditEntry(
-                task_id=admission.command.task_id,
-                command_id=admission.command.command_id,
-                operation=envelope.operation,
-                authenticated_principal=principal,
-                policy_version=admission.policy.policy_version,
-                decision_reference=admission.policy.decision_reference,
-                outcome=result.outcome,
-                admitted_at=admission.command.admitted_at,
-                completed_at=completed_at,
-                declared_input_bytes=envelope.declared_input_bytes,
-                declared_output_bytes=envelope.declared_output_bytes,
+        with contextlib.suppress(Exception):
+            await self._audit.record(
+                CommandAuditEntry(
+                    task_id=admission.command.task_id,
+                    command_id=admission.command.command_id,
+                    operation=envelope.operation,
+                    authenticated_principal=principal,
+                    policy_version=admission.policy.policy_version,
+                    decision_reference=admission.policy.decision_reference,
+                    outcome=result.outcome,
+                    admitted_at=admission.command.admitted_at,
+                    completed_at=completed_at,
+                    declared_input_bytes=envelope.declared_input_bytes,
+                    declared_output_bytes=envelope.declared_output_bytes,
+                )
             )
-        )
         return result
 
     async def _admit(
         self, principal: str, envelope: CommandEnvelope
     ) -> CommandAdmission:
-        _require_text(principal, "authenticated principal")
+        _require_identifier(principal, "authenticated principal")
         task_id = envelope.task_id
         state = await self._repository.admission_state(task_id)
         if state is None:
@@ -714,8 +733,17 @@ class CommandAdmissionGate:
             fence_generation=self._fence.generation,
             admitted_at=self._now(),
         )
+        repository_admission = asyncio.create_task(self._repository.admit(request))
         try:
-            decision = await self._repository.admit(request)
+            decision = await asyncio.shield(repository_admission)
+        except asyncio.CancelledError:
+            # Admission is a durable transition. Let it settle so cancellation
+            # cannot land after the store commits but before ownership returns,
+            # leaking the task's single in-flight slot.
+            decision = await repository_admission
+            if decision.command is not None:
+                await self._abandon(decision.command, envelope, principal, result)
+            raise
         except Exception as error:
             raise CommandPersistenceError(task_id, "admit", error) from error
         if decision.refusal is not None:
@@ -986,12 +1014,12 @@ class InMemoryCommandRepository:
 
         A restarted manager cannot confirm what happened to commands admitted
         by a prior process: each is recorded ``UNKNOWN`` and its slot released,
-        and nothing is re-issued (Decision 20). Every surviving state then
+        and nothing is re-issued. Every surviving state then
         carries the new generation, so the task stays admissible under its
         current owner.
         """
 
-        _require_text(fence_generation, "fence generation")
+        _require_identifier(fence_generation, "fence generation")
         await self._journal_append(
             CommandEvent(
                 kind=CommandEventKind.FENCE_ADOPTED,
@@ -1028,6 +1056,13 @@ def _require_text(value: str, field: str) -> None:
         raise ValueError(f"{field} must be a non-empty string")
     if any(ord(character) < 32 for character in value):
         raise ValueError(f"{field} contains invalid text")
+
+
+def _require_identifier(value: object, field: str) -> None:
+    if not is_identifier(value):
+        raise ValueError(
+            f"{field} must contain 1-64 ASCII letters, digits, underscores, or hyphens"
+        )
 
 
 def _timestamp(value: datetime) -> datetime:

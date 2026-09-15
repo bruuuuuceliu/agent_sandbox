@@ -3,10 +3,9 @@
 Policy evaluation is mandatory before every relay side effect. The evaluation
 schema below reserves the normalized fields a policy may eventually match on,
 but the allowlist syntax, filters, normalization rules, and matching strategy
-are deliberately unspecified: they remain an open decision (plan Decision 19)
-and must not be embedded in implementation. Until a filtering method is
-approved, the only shipped policy is the default-deny behaviour required when a
-profile references a missing or invalid policy.
+are deliberately unspecified and must not be embedded in implementation. Until
+a filtering method is configured, the only shipped policy is the default-deny
+behaviour used when a profile references a missing or invalid policy.
 """
 
 from __future__ import annotations
@@ -48,7 +47,10 @@ class PolicyReference:
     policy_version: int
 
     def __post_init__(self) -> None:
-        if self.schema_version != POLICY_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != POLICY_SCHEMA_VERSION
+        ):
             raise CommandPolicyError(
                 f"unsupported policy schema version: {self.schema_version}"
             )
@@ -78,7 +80,10 @@ class PolicyEvaluation:
     declared_size: int | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != POLICY_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != POLICY_SCHEMA_VERSION
+        ):
             raise CommandPolicyError(
                 f"unsupported policy schema version: {self.schema_version}"
             )
@@ -133,9 +138,7 @@ class CommandPolicy(Protocol):
         """Evaluate one normalized command admission against this policy.
 
         Implementations must be deterministic for equal inputs and must not
-        perform side effects. The filtering method an implementation may use is
-        not yet approved; shipping a filtering policy requires an owner decision
-        recorded against plan Decision 19.
+        perform side effects.
         """
 
         ...
@@ -144,7 +147,9 @@ class CommandPolicy(Protocol):
 class DenyAllPolicy:
     """Default-deny policy used when a referenced policy is missing or invalid."""
 
-    def __init__(self, policy_version: int = 1, reason_code: str = _MISSING_POLICY) -> None:
+    def __init__(
+        self, policy_version: int = 1, reason_code: str = _MISSING_POLICY
+    ) -> None:
         if type(policy_version) is not int or policy_version < 1:
             raise CommandPolicyError("policy version must be a positive integer")
         _require_text(reason_code, "reason code")

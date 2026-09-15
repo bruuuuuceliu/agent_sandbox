@@ -102,7 +102,7 @@ class RecordingRepository:
         self.events.append(f"record_{step.value}")
         if self.step_error is step:
             raise OSError("state unavailable")
-        return replace(task, completed_steps=task.completed_steps + (step,))
+        return replace(task, completed_steps=(*task.completed_steps, step))
 
     async def mark_terminal(
         self, task: TerminatingRecord, completed_at: datetime

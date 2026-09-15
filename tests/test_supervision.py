@@ -134,7 +134,7 @@ class RecordingLifecycleRepository:
         self, task: TerminatingRecord, step: CleanupStep
     ) -> TerminatingRecord:
         self.events.append(f"record_{step.value}")
-        return replace(task, completed_steps=task.completed_steps + (step,))
+        return replace(task, completed_steps=(*task.completed_steps, step))
 
     async def mark_terminal(
         self, task: TerminatingRecord, completed_at: datetime

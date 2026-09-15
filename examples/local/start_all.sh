@@ -76,8 +76,8 @@ load_env_defaults "${CONFIG_FILE}"
 
 : "${MANAGER_PORT:?MANAGER_PORT is required in local.config}"
 : "${NATS_MONITOR_PORT:?NATS_MONITOR_PORT is required in local.config}"
-: "${NATS_USERNAME:?NATS_USERNAME is required in local.env}"
-: "${NATS_PASSWORD:?NATS_PASSWORD is required in local.env}"
+: "${NATS_MANAGER_PASSWORD:?NATS_MANAGER_PASSWORD is required in local.env}"
+: "${NATS_AGENT_PASSWORD:?NATS_AGENT_PASSWORD is required in local.env}"
 
 if [[ "${INITIALIZE}" == true ]]; then
   docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" up -d --build

@@ -38,9 +38,12 @@ class PolicyReferenceTests(unittest.TestCase):
         self.assertEqual(reference.policy_version, 3)
 
     def test_rejects_unsupported_schema_version(self) -> None:
-        bad_version = cast(Literal[1], 2)  # deliberately invalid at runtime
-        with self.assertRaises(CommandPolicyError):
-            PolicyReference(schema_version=bad_version, policy_name="p", policy_version=1)
+        for value in (2, True):
+            bad_version = cast(Literal[1], value)
+            with self.subTest(value=value), self.assertRaises(CommandPolicyError):
+                PolicyReference(
+                    schema_version=bad_version, policy_name="p", policy_version=1
+                )
 
     def test_rejects_blank_name(self) -> None:
         with self.assertRaises(CommandPolicyError):
@@ -90,6 +93,15 @@ class PolicyEvaluationTests(unittest.TestCase):
 
         self.assertIsNone(evaluation.executable)
         self.assertIsNone(evaluation.declared_size)
+
+    def test_rejects_boolean_schema_version(self) -> None:
+        with self.assertRaises(CommandPolicyError):
+            PolicyEvaluation(
+                schema_version=cast(Literal[1], True),
+                operation=RelayOperation.EXEC,
+                profile="default",
+                authenticated_principal="agent-session-1",
+            )
 
     def test_rejects_non_operation(self) -> None:
         with self.assertRaises(CommandPolicyError):

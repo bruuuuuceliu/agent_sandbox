@@ -141,7 +141,7 @@ class ScriptedRelay:
                         self.payloads.append(frame.payload)
         if output_sink is not None:
             for channel, chunk in self._outputs:
-                output_sink(channel, chunk)
+                await output_sink(channel, chunk)
         if self._hang:
             await asyncio.Event().wait()
         return self._result
@@ -459,13 +459,81 @@ class RelayWorkspaceDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(raised.exception.result.outcome, CommandOutcome.FAILED)
         self.assertEqual(await repo.outcome("download-1"), CommandOutcome.FAILED)
 
+    async def test_download_backpressures_after_two_buffered_frames(self) -> None:
+        fourth_delivered = asyncio.Event()
+
+        class BackpressureRelay(ScriptedRelay):
+            async def execute(
+                self,
+                command: AdmittedCommand,
+                envelope: CommandEnvelope,
+                input_stream: InputStream | None,
+                output_sink: OutputSink | None = None,
+            ) -> CommandResult:
+                assert output_sink is not None
+                for chunk in (b"one", b"two", b"three", b"four"):
+                    await output_sink(1, chunk)
+                    if chunk == b"four":
+                        fourth_delivered.set()
+                return self._result
+
+        repo = repository(admission_state())
+        stream = cast(
+            AsyncGenerator[bytes, None],
+            service(repo, BackpressureRelay(success("download-1"))).download(
+                "task-1", "download-1", "/results/report.bin", 1024
+            ),
+        )
+
+        self.assertEqual(await anext(stream), b"one")
+        await asyncio.sleep(0)
+        self.assertFalse(fourth_delivered.is_set())
+        self.assertEqual(await anext(stream), b"two")
+        await asyncio.wait_for(fourth_delivered.wait(), timeout=1.0)
+        self.assertEqual([chunk async for chunk in stream], [b"three", b"four"])
+
+    async def test_abandoning_a_full_download_queue_does_not_deadlock(self) -> None:
+        fourth_attempted = asyncio.Event()
+
+        class SaturatingRelay(ScriptedRelay):
+            async def execute(
+                self,
+                command: AdmittedCommand,
+                envelope: CommandEnvelope,
+                input_stream: InputStream | None,
+                output_sink: OutputSink | None = None,
+            ) -> CommandResult:
+                assert output_sink is not None
+                for chunk in (b"one", b"two", b"three", b"four"):
+                    if chunk == b"four":
+                        fourth_attempted.set()
+                    await output_sink(1, chunk)
+                return self._result
+
+        repo = repository(admission_state())
+        stream = cast(
+            AsyncGenerator[bytes, None],
+            service(repo, SaturatingRelay(success("download-1"))).download(
+                "task-1", "download-1", "/results/report.bin", 1024
+            ),
+        )
+
+        self.assertEqual(await anext(stream), b"one")
+        await asyncio.wait_for(fourth_attempted.wait(), timeout=1.0)
+        await asyncio.wait_for(stream.aclose(), timeout=1.0)
+
+        self.assertIs(await repo.outcome("download-1"), CommandOutcome.UNKNOWN)
+        state = await repo.admission_state("task-1")
+        assert state is not None
+        self.assertIsNone(state.in_flight_command_id)
+
     async def test_download_over_limit_fails_closed(self) -> None:
         outputs = ((1, b"x" * 600), (1, b"y" * 600))
         relay = ScriptedRelay(success("download-1"), outputs=outputs)
         repo = repository(admission_state())
 
         with self.assertRaises(WorkspaceTransferError) as raised:
-            async for chunk in service(repo, relay).download(
+            async for _chunk in service(repo, relay).download(
                 "task-1", "download-1", "/results/report.bin", 1024
             ):
                 pass
@@ -557,6 +625,14 @@ class RelayWorkspaceContractTests(unittest.TestCase):
                 layout(),
                 FakeInspector(),
                 "  ",
+            )
+
+        with self.assertRaises(WorkspaceError):
+            RelayWorkspaceService(
+                command_gate(repository(admission_state()), relay),
+                layout(),
+                FakeInspector(),
+                "agent.session",
             )
 
     def test_checksum_format_is_required_for_construction(self) -> None:

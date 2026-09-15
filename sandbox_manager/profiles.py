@@ -48,7 +48,10 @@ class SandboxProfile:
     volume_mounts: tuple[ProfileMount, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != PROFILE_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != PROFILE_SCHEMA_VERSION
+        ):
             raise ProfileError(
                 f"unsupported profile schema version: {self.schema_version}"
             )

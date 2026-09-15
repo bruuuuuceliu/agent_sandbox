@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, cast
 
+from .identifiers import is_identifier
+
 SCHEMA_VERSION: Literal[1] = 1
 
 _REQUIRED_FIELDS = frozenset(
@@ -43,6 +45,20 @@ class SpawnRequest:
     agent_session_id: str
     sandbox_type: str
     requested_deadline: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise UnsupportedSchemaVersion(self.schema_version)
+        for value, field in (
+            (self.request_id, "request_id"),
+            (self.task_id, "task_id"),
+            (self.agent_session_id, "agent_session_id"),
+        ):
+            _require_identifier(value, field)
+        _require_text(self.sandbox_type, "sandbox_type")
+        if self.requested_deadline is not None:
+            deadline = _aware_deadline(self.requested_deadline)
+            object.__setattr__(self, "requested_deadline", deadline)
 
     def fingerprint(self) -> str:
         """Return a stable digest of the complete immutable request."""
@@ -107,9 +123,9 @@ def decode_spawn_request(payload: bytes | str) -> SpawnRequest:
 
     return SpawnRequest(
         schema_version=SCHEMA_VERSION,
-        request_id=_required_text(values, "request_id"),
-        task_id=_required_text(values, "task_id"),
-        agent_session_id=_required_text(values, "agent_session_id"),
+        request_id=_required_identifier(values, "request_id"),
+        task_id=_required_identifier(values, "task_id"),
+        agent_session_id=_required_identifier(values, "agent_session_id"),
         sandbox_type=_required_text(values, "sandbox_type"),
         requested_deadline=_deadline(values.get("requested_deadline")),
     )
@@ -126,11 +142,30 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _required_text(values: dict[str, object], field: str) -> str:
     value = values[field]
+    _require_text(value, field)
+    assert isinstance(value, str)
+    return value
+
+
+def _require_text(value: object, field: str) -> None:
     if not isinstance(value, str) or not value or value != value.strip():
         raise SpawnRequestError(f"{field} must be a non-empty string")
     if any(ord(character) < 32 for character in value):
         raise SpawnRequestError(f"{field} contains invalid text")
+
+
+def _required_identifier(values: dict[str, object], field: str) -> str:
+    value = values[field]
+    _require_identifier(value, field)
+    assert isinstance(value, str)
     return value
+
+
+def _require_identifier(value: object, field: str) -> None:
+    if not is_identifier(value):
+        raise SpawnRequestError(
+            f"{field} must contain 1-64 ASCII letters, digits, underscores, or hyphens"
+        )
 
 
 def _deadline(value: object) -> datetime | None:
@@ -144,6 +179,10 @@ def _deadline(value: object) -> datetime | None:
         raise SpawnRequestError(
             "requested_deadline must be an ISO 8601 timestamp"
         ) from error
+    return _aware_deadline(deadline)
+
+
+def _aware_deadline(deadline: datetime) -> datetime:
     if deadline.tzinfo is None or deadline.utcoffset() is None:
         raise SpawnRequestError("requested_deadline must include a timezone")
     return deadline.astimezone(UTC)

@@ -5,6 +5,8 @@ import unittest
 from datetime import UTC, datetime
 
 from sandbox_manager.spawn import (
+    SCHEMA_VERSION,
+    SpawnRequest,
     SpawnRequestError,
     UnsupportedSchemaVersion,
     decode_spawn_request,
@@ -78,6 +80,9 @@ class SpawnRequestTests(unittest.TestCase):
             "unknown field": valid_payload(image="unapproved:latest"),
             "empty identifier": valid_payload(request_id=""),
             "control character": valid_payload(task_id="task\n1"),
+            "subject separator": valid_payload(task_id="task.1"),
+            "non-ASCII identifier": valid_payload(agent_session_id="sessión-1"),
+            "oversized identifier": valid_payload(request_id="x" * 65),
             "naive deadline": valid_payload(requested_deadline="2026-08-28T12:30:00"),
             "duplicate field": (
                 b'{"schema_version":1,"request_id":"first",'
@@ -95,6 +100,26 @@ class SpawnRequestTests(unittest.TestCase):
             decode_spawn_request(valid_payload(schema_version=2))
 
         self.assertEqual(raised.exception.version, 2)
+
+    def test_direct_construction_enforces_the_wire_invariants(self) -> None:
+        with self.assertRaises(SpawnRequestError):
+            SpawnRequest(
+                schema_version=SCHEMA_VERSION,
+                request_id="request.1",
+                task_id="task-1",
+                agent_session_id="session-1",
+                sandbox_type="python",
+            )
+
+        with self.assertRaises(SpawnRequestError):
+            SpawnRequest(
+                schema_version=SCHEMA_VERSION,
+                request_id="request-1",
+                task_id="task-1",
+                agent_session_id="session-1",
+                sandbox_type="python",
+                requested_deadline=datetime(2026, 8, 28, 12, 30),  # noqa: DTZ001
+            )
 
 
 if __name__ == "__main__":

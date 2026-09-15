@@ -101,7 +101,7 @@ command or shutdown). Regression-tested by the injection suite.
 
 - Full pytest local gate: 355 passed, 89 subtests (includes the new
   redaction and fault-injection suites).
-- `ruff` clean across `src`, `tests`, `examples/spikes`.
+- `ruff` clean across `sandbox_manager`, `tests`, `examples/spikes`.
 - `mypy --strict` clean across 51 source files.
 - Live NATS spike (`nats_lifecycle_spike.py`) against the real server
   (nats:2.11-alpine, single-user auth, git-ignored `config/local.env`):

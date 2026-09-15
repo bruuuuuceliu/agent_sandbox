@@ -4,7 +4,7 @@ import hashlib
 import unittest
 from datetime import UTC, datetime
 
-from sandbox_manager.kubernetes import sandbox_resource_name
+from sandbox_manager.kubernetes import TASK_ANNOTATION, sandbox_resource_name
 from sandbox_manager.kubernetes_lifecycle import (
     KubernetesEphemeralCleaner,
     KubernetesIdentityError,
@@ -42,7 +42,7 @@ def observed(reference: ObjectReference, task_id: str = "task-1") -> ObservedObj
                 task_id.encode("utf-8")
             ).hexdigest()[:32],
         },
-        annotations={"sandbox-manager.io/task-id": task_id},
+        annotations={TASK_ANNOTATION: task_id},
     )
 
 
@@ -158,7 +158,7 @@ class KubernetesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             current.reference,
             current.uid,
             current.labels,
-            {"sandbox-manager.io/task-id": "another-task"},
+            {TASK_ANNOTATION: "another-task"},
         )
 
         with self.assertRaises(KubernetesIdentityError):

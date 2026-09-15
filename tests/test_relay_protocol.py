@@ -81,6 +81,21 @@ class CommandEnvelopeTests(unittest.TestCase):
                 declared_output_bytes=0,
             )
 
+    def test_rejects_identifiers_that_cannot_form_subjects(self) -> None:
+        for identifier in ("command.1", "cómmand-1", "x" * 65):
+            with self.subTest(identifier=identifier), self.assertRaises(
+                RelayProtocolError
+            ):
+                CommandEnvelope(
+                    schema_version=RELAY_SCHEMA_VERSION,
+                    command_id=identifier,
+                    task_id="task-1",
+                    operation=RelayOperation.EXEC,
+                    correlation_id="correlation-1",
+                    declared_input_bytes=0,
+                    declared_output_bytes=0,
+                )
+
 
 class FrameCodecTests(unittest.TestCase):
     def test_data_frame_round_trip(self) -> None:
@@ -93,11 +108,26 @@ class FrameCodecTests(unittest.TestCase):
     def test_cancel_and_terminal_round_trip(self) -> None:
         cancel = CancelSignal(RELAY_SCHEMA_VERSION, "command-1")
         terminal = TerminalFrame(
-            RELAY_SCHEMA_VERSION, "command-1", CommandOutcome.UNKNOWN, "stream_lost"
+            RELAY_SCHEMA_VERSION,
+            "command-1",
+            CommandOutcome.UNKNOWN,
+            "stream_lost:transport",
         )
 
         self.assertEqual(decode_frame(encode_frame(cancel)), cancel)
         self.assertEqual(decode_frame(encode_frame(terminal)), terminal)
+
+    def test_terminal_rejects_unencodable_reason_codes(self) -> None:
+        for reason in ("déconnexion", "x" * 65_536):
+            with self.subTest(reason_length=len(reason)), self.assertRaises(
+                RelayProtocolError
+            ):
+                TerminalFrame(
+                    RELAY_SCHEMA_VERSION,
+                    "command-1",
+                    CommandOutcome.UNKNOWN,
+                    reason,
+                )
 
     def test_terminal_frame_without_reason_round_trip(self) -> None:
         terminal = TerminalFrame(RELAY_SCHEMA_VERSION, "command-1", CommandOutcome.SUCCESS)
