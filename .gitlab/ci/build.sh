@@ -24,5 +24,11 @@ while read -r name dockerfile; do
   if [ "${RAG_CPU_ONLY_TORCH:-0}" = 1 ]; then
     set -- "$@" --opt build-arg:INSTALL_CPU_ONLY_TORCH=1
   fi
+  for proxy_name in HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+    proxy_value=$(printenv "$proxy_name" || true)
+    if [ -n "$proxy_value" ]; then
+      set -- "$@" --opt "build-arg:$proxy_name=$proxy_value"
+    fi
+  done
   buildctl-daemonless.sh "$@"
 done < .gitlab/ci/images.txt

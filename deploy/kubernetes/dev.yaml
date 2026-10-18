@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandbox-manager-config
+  namespace: agents-dev
+  labels:
+    app.kubernetes.io/part-of: agent-platform-dev
+data:
+  dev.config: 'APP_ENV=dev
+
+    MANAGER_PORT=15180
+
+    TARGET_KUBE_CONTEXT=local
+
+    GVISOR_RUNTIME_CLASS=gvisor
+
+    MAX_SANDBOXES=10
+
+    SANDBOX_CPU_REQUEST=250m
+
+    SANDBOX_MEMORY_REQUEST=256Mi
+
+    SANDBOX_CPU_LIMIT=1
+
+    SANDBOX_MEMORY_LIMIT=512Mi
+
+    AGENT_CHECK_INTERVAL=15s
+
+    AGENT_CHECK_TIMEOUT=5s
+
+    NATS_URL=nats://${NATS_USERNAME}:${NATS_PASSWORD}@nats.agents-dev.svc.cluster.local:4222
+
+    '
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-manager
+  namespace: agents-dev
+  labels:
+    app.kubernetes.io/part-of: agent-platform-dev
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sandbox-manager
+  template:
+    metadata:
+      labels:
+        app: sandbox-manager
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: sandbox-manager
+        image: bruceserver.tail3d8162.ts.net:5050/bruce/agent_sandbox:dev
+        imagePullPolicy: Always
+        env:
+        - name: NATS_USERNAME
+          value: sandbox-manager
+        - name: NATS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: agents-runtime
+              key: NATS_PASSWORD
+        resources:
+          requests:
+            cpu: 50m
+            memory: 96Mi
+          limits:
+            cpu: '2'
+            memory: 768Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        args:
+        - --config
+        - /etc/sandbox/dev.config
+        volumeMounts:
+        - name: config
+          mountPath: /etc/sandbox
+          readOnly: true
+        ports:
+        - containerPort: 15180
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 15180
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 12
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 15180
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 5
+        startupProbe:
+          tcpSocket:
+            port: 15180
+          periodSeconds: 5
+          failureThreshold: 120
+      imagePullSecrets:
+      - name: gitlab-registry-agent-sandbox
+      volumes:
+      - name: config
+        configMap:
+          name: sandbox-manager-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-manager
+  namespace: agents-dev
+  labels:
+    app.kubernetes.io/part-of: agent-platform-dev
+spec:
+  selector:
+    app: sandbox-manager
+  ports:
+  - port: 15180
+    targetPort: 15180
