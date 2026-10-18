@@ -112,6 +112,8 @@ def obsolete(tags, keep=8, preserve=()):
     builds = [tag["name"] for tag in tags if TAG.fullmatch(tag["name"])]
     builds.sort(key=lambda value: (int(TAG.fullmatch(value).group(1)), value), reverse=True)
     retained = set(preserve) & set(builds)
+    if len(retained) > keep:
+        raise RuntimeError("More running dev versions than the retention limit; refusing to delete them")
     for tag in builds:
         if len(retained) >= keep:
             break
@@ -121,6 +123,7 @@ def obsolete(tags, keep=8, preserve=()):
 
 def prune():
     project = os.environ["CI_PROJECT_ID"]
+    pins = deployed_images()
     expected = {image.split("/", 1)[1] for image in image_names()}
     repositories = pages(f"projects/{project}/registry/repositories")
     for repository in repositories:
@@ -129,15 +132,18 @@ def prune():
         path = f"projects/{project}/registry/repositories/{repository['id']}/tags"
         tags = pages(path)
         # Preserve the image referenced by dev, even if newer builds failed.
-        preserve = []
+        preserve = [tag["name"] for tag in tags
+                    if TAG.fullmatch(tag["name"]) and f"{repository['location']}:{tag['name']}" in pins]
         if any(tag["name"] == "dev" for tag in tags):
             alias, _ = api(f"{path}/dev")
+            alias_builds = []
             for tag in tags:
                 if TAG.fullmatch(tag["name"]):
                     details, _ = api(f"{path}/{tag['name']}")
                     if details.get("digest") == alias.get("digest"):
-                        preserve.append(tag["name"])
-            preserve = sorted(preserve, key=lambda tag: int(TAG.fullmatch(tag).group(1)), reverse=True)[:1]
+                        alias_builds.append(tag["name"])
+            alias_builds.sort(key=lambda tag: int(TAG.fullmatch(tag).group(1)), reverse=True)
+            preserve = list(set(preserve + alias_builds[:1]))
         for tag in obsolete(tags, preserve=preserve):
             api(f"{path}/{urllib.parse.quote(tag, safe='')}", "DELETE")
             print(f"Removed {repository['path']}:{tag}", flush=True)
@@ -185,6 +191,23 @@ def kubectl_binary():
         target.write_bytes(content)
     target.chmod(0o700)
     return str(target.resolve())
+
+
+def deployed_images():
+    if os.environ.get("DEV_DEPLOY_ENABLED") != "true":
+        return set()
+    command = [kubectl_binary(), "--kubeconfig", os.environ["KUBE_CONFIG"],
+               "--namespace", os.environ["KUBE_NAMESPACE"]]
+    if os.environ.get("KUBE_CONTEXT"):
+        command += ["--context", os.environ["KUBE_CONTEXT"]]
+    images = set()
+    for line in Path(".gitlab/ci/workloads.txt").read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        resource = line.split()[0]
+        workload = json.loads(subprocess.check_output([*command, "get", resource, "-o", "json"]))
+        images.update(c["image"] for c in workload["spec"]["template"]["spec"]["containers"])
+    return images
 
 
 def deploy():

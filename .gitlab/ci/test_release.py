@@ -43,6 +43,18 @@ class ReleaseChecks(unittest.TestCase):
                 auth.assert_not_called()
                 self.assertEqual(Path("dev-release.env").read_text(), "DEV_PUBLISHED=false\n")
 
+    def test_running_old_version_and_alias_are_retained_within_eight(self):
+        tags = [{"name": f"dev-{n}-aabbccdd"} for n in range(1, 13)]
+        deleted = release.obsolete(tags, preserve=["dev-1-aabbccdd", "dev-2-aabbccdd"])
+        self.assertNotIn("dev-1-aabbccdd", deleted)
+        self.assertNotIn("dev-2-aabbccdd", deleted)
+        self.assertEqual(len(tags) - len(deleted), 8)
+
+    def test_too_many_running_versions_refuses_destructive_cleanup(self):
+        tags = [{"name": f"dev-{n}-aabbccdd"} for n in range(1, 10)]
+        with self.assertRaises(RuntimeError):
+            release.obsolete(tags, preserve=[tag["name"] for tag in tags])
+
     def test_all_components_are_checked_before_first_alias_is_moved(self):
         with workspace(), patch.object(release, "current", return_value=True):
             with patch.object(release, "image_names", return_value=["registry/one", "registry/two"]):
