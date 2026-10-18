@@ -26,6 +26,7 @@ services and database/broker ports remain internal. The web proxy forwards API
 requests to the gateway. Add a model provider credential through the application
 before testing real model calls; deployment does not provision external API keys.
 
+Images still selected by a Deployment are preserved during cleanup.
 Eight versioned dev tags are retained per image component plus the moving dev
 alias. simple_agent builds eleven components. Production and release tags are
 not part of this cleanup. Registry garbage collection handles unused blob space.
