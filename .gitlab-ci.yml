@@ -8,6 +8,9 @@ stages: [build, publish, deploy, cleanup]
 default:
   tags: [agent-build]
   interruptible: false
+  cache:
+    key: kubectl-v1
+    paths: [.cache/kubectl-*]
 
 variables:
   BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
