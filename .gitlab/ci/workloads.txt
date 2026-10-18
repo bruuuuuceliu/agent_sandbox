@@ -1,0 +1,2 @@
+# resource container image-component; must match the Rancher workloads
+deployment/sandbox-manager sandbox-manager app

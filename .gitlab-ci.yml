@@ -1,0 +1,60 @@
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+    - when: never
+
+stages: [build, publish, deploy, cleanup]
+
+default:
+  tags: [agent-build]
+  interruptible: false
+
+variables:
+  BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  KUBECTL_VERSION: v1.31.14
+  DEV_DEPLOY_ENABLED: "false"
+
+build_dev:
+  stage: build
+  image:
+    name: moby/buildkit:v0.23.2-rootless
+    entrypoint: [""]
+  script:
+    - sh .gitlab/ci/build.sh
+
+publish_dev:
+  stage: publish
+  image: python:3.12-alpine
+  resource_group: dev-release
+  script:
+    - python .gitlab/ci/test_release.py
+    - python .gitlab/ci/release.py publish
+  artifacts:
+    reports:
+      dotenv: dev-release.env
+    expire_in: 1 day
+
+deploy_dev:
+  stage: deploy
+  image: python:3.12-alpine
+  resource_group: dev-release
+  needs: [publish_dev]
+  rules:
+    - if: '$DEV_DEPLOY_ENABLED == "true" && $KUBE_NAMESPACE && $KUBE_CONFIG'
+    - when: never
+  environment:
+    name: dev
+    deployment_tier: development
+  cache:
+    key: kubectl-v1
+    paths: [.cache/kubectl-*]
+  script:
+    - python .gitlab/ci/release.py deploy
+
+cleanup_dev:
+  stage: cleanup
+  image: python:3.12-alpine
+  resource_group: dev-release
+  when: always
+  script:
+    - python .gitlab/ci/release.py cleanup
