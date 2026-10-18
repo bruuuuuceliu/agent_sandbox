@@ -20,7 +20,7 @@ while read -r name dockerfile; do
     --opt filename="$(basename "$dockerfile")" \
     --opt "label:org.opencontainers.image.revision=$CI_COMMIT_SHA" \
     --opt "label:org.opencontainers.image.source=$CI_PROJECT_URL" \
-    --output "type=image,name=$image:$IMAGE_TAG,push=true"
+    --import-cache "type=registry,ref=$image:dev"     --export-cache type=inline     --output "type=image,name=$image:$IMAGE_TAG,push=true"
   if [ "${RAG_CPU_ONLY_TORCH:-0}" = 1 ]; then
     set -- "$@" --opt build-arg:INSTALL_CPU_ONLY_TORCH=1
   fi
